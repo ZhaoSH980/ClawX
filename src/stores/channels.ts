@@ -3,7 +3,13 @@
  * Manages messaging channel state
  */
 import { create } from 'zustand';
-import type { Channel } from '../types/channel';
+import type { Channel, ChannelType } from '../types/channel';
+
+interface AddChannelParams {
+  type: ChannelType;
+  name: string;
+  token?: string;
+}
 
 interface ChannelsState {
   channels: Channel[];
@@ -12,10 +18,14 @@ interface ChannelsState {
   
   // Actions
   fetchChannels: () => Promise<void>;
+  addChannel: (params: AddChannelParams) => Promise<Channel>;
+  deleteChannel: (channelId: string) => Promise<void>;
   connectChannel: (channelId: string) => Promise<void>;
   disconnectChannel: (channelId: string) => Promise<void>;
+  requestQrCode: (channelType: ChannelType) => Promise<{ qrCode: string; sessionId: string }>;
   setChannels: (channels: Channel[]) => void;
   updateChannel: (channelId: string, updates: Partial<Channel>) => void;
+  clearError: () => void;
 }
 
 export const useChannelsStore = create<ChannelsState>((set, get) => ({
@@ -35,16 +45,77 @@ export const useChannelsStore = create<ChannelsState>((set, get) => ({
       if (result.success && result.result) {
         set({ channels: result.result, loading: false });
       } else {
-        set({ error: result.error || 'Failed to fetch channels', loading: false });
+        // Gateway might not be running, don't show error for empty channels
+        set({ channels: [], loading: false });
       }
     } catch (error) {
-      set({ error: String(error), loading: false });
+      // Gateway not running - start with empty channels
+      set({ channels: [], loading: false });
     }
+  },
+  
+  addChannel: async (params) => {
+    try {
+      const result = await window.electron.ipcRenderer.invoke(
+        'gateway:rpc',
+        'channels.add',
+        params
+      ) as { success: boolean; result?: Channel; error?: string };
+      
+      if (result.success && result.result) {
+        set((state) => ({
+          channels: [...state.channels, result.result!],
+        }));
+        return result.result;
+      } else {
+        // If gateway is not available, create a local channel for now
+        const newChannel: Channel = {
+          id: `local-${Date.now()}`,
+          type: params.type,
+          name: params.name,
+          status: 'disconnected',
+        };
+        set((state) => ({
+          channels: [...state.channels, newChannel],
+        }));
+        return newChannel;
+      }
+    } catch (error) {
+      // Create local channel if gateway unavailable
+      const newChannel: Channel = {
+        id: `local-${Date.now()}`,
+        type: params.type,
+        name: params.name,
+        status: 'disconnected',
+      };
+      set((state) => ({
+        channels: [...state.channels, newChannel],
+      }));
+      return newChannel;
+    }
+  },
+  
+  deleteChannel: async (channelId) => {
+    try {
+      await window.electron.ipcRenderer.invoke(
+        'gateway:rpc',
+        'channels.delete',
+        { channelId }
+      );
+    } catch (error) {
+      // Continue with local deletion even if gateway fails
+      console.error('Failed to delete channel from gateway:', error);
+    }
+    
+    // Remove from local state
+    set((state) => ({
+      channels: state.channels.filter((c) => c.id !== channelId),
+    }));
   },
   
   connectChannel: async (channelId) => {
     const { updateChannel } = get();
-    updateChannel(channelId, { status: 'connecting' });
+    updateChannel(channelId, { status: 'connecting', error: undefined });
     
     try {
       const result = await window.electron.ipcRenderer.invoke(
@@ -64,18 +135,33 @@ export const useChannelsStore = create<ChannelsState>((set, get) => ({
   },
   
   disconnectChannel: async (channelId) => {
+    const { updateChannel } = get();
+    
     try {
       await window.electron.ipcRenderer.invoke(
         'gateway:rpc',
         'channels.disconnect',
         { channelId }
       );
-      
-      const { updateChannel } = get();
-      updateChannel(channelId, { status: 'disconnected' });
     } catch (error) {
       console.error('Failed to disconnect channel:', error);
     }
+    
+    updateChannel(channelId, { status: 'disconnected', error: undefined });
+  },
+  
+  requestQrCode: async (channelType) => {
+    const result = await window.electron.ipcRenderer.invoke(
+      'gateway:rpc',
+      'channels.requestQr',
+      { type: channelType }
+    ) as { success: boolean; result?: { qrCode: string; sessionId: string }; error?: string };
+    
+    if (result.success && result.result) {
+      return result.result;
+    }
+    
+    throw new Error(result.error || 'Failed to request QR code');
   },
   
   setChannels: (channels) => set({ channels }),
@@ -87,4 +173,6 @@ export const useChannelsStore = create<ChannelsState>((set, get) => ({
       ),
     }));
   },
+  
+  clearError: () => set({ error: null }),
 }));

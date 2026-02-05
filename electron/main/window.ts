@@ -3,7 +3,6 @@
  * Handles window state persistence and multi-window management
  */
 import { BrowserWindow, screen } from 'electron';
-import Store from 'electron-store';
 
 interface WindowState {
   x?: number;
@@ -13,21 +12,31 @@ interface WindowState {
   isMaximized: boolean;
 }
 
-const store = new Store<{ windowState: WindowState }>({
-  name: 'window-state',
-  defaults: {
-    windowState: {
-      width: 1280,
-      height: 800,
-      isMaximized: false,
-    },
-  },
-});
+// Lazy-load electron-store (ESM module)
+let windowStateStore: any = null;
+
+async function getStore() {
+  if (!windowStateStore) {
+    const Store = (await import('electron-store')).default;
+    windowStateStore = new Store<{ windowState: WindowState }>({
+      name: 'window-state',
+      defaults: {
+        windowState: {
+          width: 1280,
+          height: 800,
+          isMaximized: false,
+        },
+      },
+    });
+  }
+  return windowStateStore;
+}
 
 /**
  * Get saved window state with bounds validation
  */
-export function getWindowState(): WindowState {
+export async function getWindowState(): Promise<WindowState> {
+  const store = await getStore();
   const state = store.get('windowState');
   
   // Validate that the window is visible on a screen
@@ -56,7 +65,8 @@ export function getWindowState(): WindowState {
 /**
  * Save window state
  */
-export function saveWindowState(win: BrowserWindow): void {
+export async function saveWindowState(win: BrowserWindow): Promise<void> {
+  const store = await getStore();
   const isMaximized = win.isMaximized();
   
   if (!isMaximized) {

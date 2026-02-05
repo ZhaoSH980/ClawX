@@ -2,7 +2,9 @@
  * Persistent Storage
  * Electron-store wrapper for application settings
  */
-import Store from 'electron-store';
+
+// Lazy-load electron-store (ESM module)
+let settingsStoreInstance: any = null;
 
 /**
  * Application settings schema
@@ -65,58 +67,70 @@ const defaults: AppSettings = {
 };
 
 /**
- * Create settings store
+ * Get the settings store instance (lazy initialization)
  */
-export const settingsStore = new Store<AppSettings>({
-  name: 'settings',
-  defaults,
-});
+async function getSettingsStore() {
+  if (!settingsStoreInstance) {
+    const Store = (await import('electron-store')).default;
+    settingsStoreInstance = new Store<AppSettings>({
+      name: 'settings',
+      defaults,
+    });
+  }
+  return settingsStoreInstance;
+}
 
 /**
  * Get a setting value
  */
-export function getSetting<K extends keyof AppSettings>(key: K): AppSettings[K] {
-  return settingsStore.get(key);
+export async function getSetting<K extends keyof AppSettings>(key: K): Promise<AppSettings[K]> {
+  const store = await getSettingsStore();
+  return store.get(key);
 }
 
 /**
  * Set a setting value
  */
-export function setSetting<K extends keyof AppSettings>(
+export async function setSetting<K extends keyof AppSettings>(
   key: K,
   value: AppSettings[K]
-): void {
-  settingsStore.set(key, value);
+): Promise<void> {
+  const store = await getSettingsStore();
+  store.set(key, value);
 }
 
 /**
  * Get all settings
  */
-export function getAllSettings(): AppSettings {
-  return settingsStore.store;
+export async function getAllSettings(): Promise<AppSettings> {
+  const store = await getSettingsStore();
+  return store.store;
 }
 
 /**
  * Reset settings to defaults
  */
-export function resetSettings(): void {
-  settingsStore.clear();
+export async function resetSettings(): Promise<void> {
+  const store = await getSettingsStore();
+  store.clear();
 }
 
 /**
  * Export settings to JSON
  */
-export function exportSettings(): string {
-  return JSON.stringify(settingsStore.store, null, 2);
+export async function exportSettings(): Promise<string> {
+  const store = await getSettingsStore();
+  return JSON.stringify(store.store, null, 2);
 }
 
 /**
  * Import settings from JSON
  */
-export function importSettings(json: string): void {
+export async function importSettings(json: string): Promise<void> {
   try {
     const settings = JSON.parse(json);
-    settingsStore.set(settings);
+    const store = await getSettingsStore();
+    store.set(settings);
   } catch (error) {
     throw new Error('Invalid settings JSON');
   }
