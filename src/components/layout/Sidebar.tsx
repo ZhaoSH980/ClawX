@@ -2,7 +2,6 @@
  * Sidebar Component
  * Navigation sidebar with menu items
  */
-import { useState, useEffect } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
   Home,
@@ -21,7 +20,7 @@ import { useSettingsStore } from '@/stores/settings';
 import { useGatewayStore } from '@/stores/gateway';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { toast } from 'sonner';
+
 
 interface NavItemProps {
   to: string;
@@ -65,35 +64,7 @@ export function Sidebar() {
   const sidebarCollapsed = useSettingsStore((state) => state.sidebarCollapsed);
   const setSidebarCollapsed = useSettingsStore((state) => state.setSidebarCollapsed);
   const devModeUnlocked = useSettingsStore((state) => state.devModeUnlocked);
-  const setDevModeUnlocked = useSettingsStore((state) => state.setDevModeUnlocked);
   const gatewayStatus = useGatewayStore((state) => state.status);
-  
-  const [versionClicks, setVersionClicks] = useState(0);
-  const [, setAppVersion] = useState('0.1.0');
-  
-  // Get app version
-  useEffect(() => {
-    window.electron.ipcRenderer.invoke('app:version').then((version) => {
-      setAppVersion(version as string);
-    });
-  }, []);
-  
-  // Handle version click for dev mode unlock
-  const _handleVersionClick = () => {
-    const clicks = versionClicks + 1;
-    setVersionClicks(clicks);
-    
-    if (clicks >= 5) {
-      if (!devModeUnlocked) {
-        setDevModeUnlocked(true);
-        toast.success('Developer mode unlocked!');
-      }
-      setVersionClicks(0);
-    }
-    
-    // Reset after 2 seconds of inactivity
-    setTimeout(() => setVersionClicks(0), 2000);
-  };
   
   // Open developer console
   const openDevConsole = () => {
