@@ -77,6 +77,7 @@ const providers: Provider[] = [
   { id: 'anthropic', name: 'Anthropic', model: 'Claude', icon: '🤖', placeholder: 'sk-ant-...' },
   { id: 'openai', name: 'OpenAI', model: 'GPT-4', icon: '💚', placeholder: 'sk-...' },
   { id: 'google', name: 'Google', model: 'Gemini', icon: '🔷', placeholder: 'AI...' },
+  { id: 'openrouter', name: 'OpenRouter', model: 'Multi-Model', icon: '🌐', placeholder: 'sk-or-...' },
 ];
 
 // Channel types
@@ -593,18 +594,26 @@ function ProviderContent({
     setValidating(true);
     setKeyValid(null);
     
-    // Simulate API key validation
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    
-    // Basic validation - just check format
-    const isValid = apiKey.length > 10;
-    setKeyValid(isValid);
-    setValidating(false);
-    
-    if (isValid) {
-      toast.success('API key validated successfully');
-    } else {
-      toast.error('Invalid API key format');
+    try {
+      // Call real API validation
+      const result = await window.electron.ipcRenderer.invoke(
+        'provider:validateKey',
+        selectedProvider,
+        apiKey
+      ) as { valid: boolean; error?: string };
+      
+      setKeyValid(result.valid);
+      
+      if (result.valid) {
+        toast.success('API key validated successfully');
+      } else {
+        toast.error(result.error || 'Invalid API key');
+      }
+    } catch (error) {
+      setKeyValid(false);
+      toast.error('Validation failed: ' + String(error));
+    } finally {
+      setValidating(false);
     }
   };
   

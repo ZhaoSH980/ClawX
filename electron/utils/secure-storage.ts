@@ -40,7 +40,7 @@ async function getProviderStore() {
 export interface ProviderConfig {
   id: string;
   name: string;
-  type: 'anthropic' | 'openai' | 'google' | 'ollama' | 'custom';
+  type: 'anthropic' | 'openai' | 'google' | 'openrouter' | 'ollama' | 'custom';
   baseUrl?: string;
   model?: string;
   enabled: boolean;

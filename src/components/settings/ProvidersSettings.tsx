@@ -31,6 +31,7 @@ const providerTypes = [
   { id: 'anthropic', name: 'Anthropic', icon: '🤖', placeholder: 'sk-ant-api03-...' },
   { id: 'openai', name: 'OpenAI', icon: '💚', placeholder: 'sk-proj-...' },
   { id: 'google', name: 'Google', icon: '🔷', placeholder: 'AIza...' },
+  { id: 'openrouter', name: 'OpenRouter', icon: '🌐', placeholder: 'sk-or-v1-...' },
   { id: 'ollama', name: 'Ollama', icon: '🦙', placeholder: 'Not required' },
   { id: 'custom', name: 'Custom', icon: '⚙️', placeholder: 'API key...' },
 ];

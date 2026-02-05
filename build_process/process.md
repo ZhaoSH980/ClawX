@@ -17,6 +17,7 @@
 * [commit_9] Skills browser - Bundles, categories, detail dialog
 * [commit_10] Cron tasks - Create/edit dialog, schedule presets, improved UI
 * [commit_11] OpenClaw submodule fix - GitHub URL, auto-generated token, WebSocket auth
+* [commit_12] Real API key validation - OpenRouter support, actual API calls to verify keys
 
 ### Plan:
 1. ~~Initialize project structure~~ ✅
@@ -44,6 +45,7 @@ All core features have been implemented:
 - Skills browser with bundles
 - Cron tasks management for scheduled automation
 - OpenClaw submodule from official GitHub (v2026.2.3) with auto-token auth
+- Real API key validation via actual API calls (Anthropic, OpenAI, Google, OpenRouter)
 
 ## Version Milestones
 

@@ -266,43 +266,324 @@ function registerProviderHandlers(): void {
     return await getDefaultProvider();
   });
   
-  // Validate API key by making a test request (simulated for now)
+  // Validate API key by making a real test request to the provider
+  // providerId can be either a stored provider ID or a provider type (e.g., 'openrouter', 'anthropic')
   ipcMain.handle('provider:validateKey', async (_, providerId: string, apiKey: string) => {
-    // In a real implementation, this would make a test API call to the provider
-    // For now, we'll just do basic format validation
     try {
-      // Basic validation based on provider type
+      // First try to get existing provider
       const provider = await getProvider(providerId);
-      if (!provider) {
-        return { valid: false, error: 'Provider not found' };
-      }
       
-      switch (provider.type) {
-        case 'anthropic':
-          if (!apiKey.startsWith('sk-ant-')) {
-            return { valid: false, error: 'Anthropic keys should start with sk-ant-' };
-          }
-          break;
-        case 'openai':
-          if (!apiKey.startsWith('sk-')) {
-            return { valid: false, error: 'OpenAI keys should start with sk-' };
-          }
-          break;
-        case 'google':
-          if (apiKey.length < 20) {
-            return { valid: false, error: 'Google API key seems too short' };
-          }
-          break;
-      }
+      // Use provider.type if provider exists, otherwise use providerId as the type
+      // This allows validation during setup when provider hasn't been saved yet
+      const providerType = provider?.type || providerId;
       
-      // Simulate API validation delay
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      
-      return { valid: true };
+      console.log(`Validating API key for provider type: ${providerType}`);
+      return await validateApiKeyWithProvider(providerType, apiKey);
     } catch (error) {
+      console.error('Validation error:', error);
       return { valid: false, error: String(error) };
     }
   });
+}
+
+/**
+ * Validate API key by making a real chat completion API call to the provider
+ * This sends a minimal "hi" message to verify the key works
+ */
+async function validateApiKeyWithProvider(
+  providerType: string,
+  apiKey: string
+): Promise<{ valid: boolean; error?: string }> {
+  const trimmedKey = apiKey.trim();
+  if (!trimmedKey) {
+    return { valid: false, error: 'API key is required' };
+  }
+
+  try {
+    switch (providerType) {
+      case 'anthropic':
+        return await validateAnthropicKey(trimmedKey);
+      case 'openai':
+        return await validateOpenAIKey(trimmedKey);
+      case 'google':
+        return await validateGoogleKey(trimmedKey);
+      case 'openrouter':
+        return await validateOpenRouterKey(trimmedKey);
+      case 'ollama':
+        // Ollama doesn't require API key validation
+        return { valid: true };
+      default:
+        // For custom providers, just check the key is not empty
+        return { valid: true };
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return { valid: false, error: errorMessage };
+  }
+}
+
+/**
+ * Parse error message from API response
+ */
+function parseApiError(data: unknown): string {
+  if (!data || typeof data !== 'object') return 'Unknown error';
+  
+  // Anthropic format: { error: { message: "..." } }
+  // OpenAI format: { error: { message: "..." } }
+  // Google format: { error: { message: "..." } }
+  const obj = data as { error?: { message?: string; type?: string }; message?: string };
+  
+  if (obj.error?.message) return obj.error.message;
+  if (obj.message) return obj.message;
+  
+  return 'Unknown error';
+}
+
+/**
+ * Validate Anthropic API key by making a minimal chat completion request
+ */
+async function validateAnthropicKey(apiKey: string): Promise<{ valid: boolean; error?: string }> {
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-3-haiku-20240307',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (response.ok) {
+      return { valid: true };
+    }
+
+    // Authentication error
+    if (response.status === 401) {
+      return { valid: false, error: 'Invalid API key' };
+    }
+
+    // Permission error (invalid key format, etc.)
+    if (response.status === 403) {
+      return { valid: false, error: parseApiError(data) };
+    }
+
+    // Rate limit or overloaded - key is valid but service is busy
+    if (response.status === 429 || response.status === 529) {
+      return { valid: true };
+    }
+
+    // Model not found or bad request but auth passed - key is valid
+    if (response.status === 400 || response.status === 404) {
+      const errorType = (data as { error?: { type?: string } })?.error?.type;
+      if (errorType === 'authentication_error' || errorType === 'invalid_api_key') {
+        return { valid: false, error: 'Invalid API key' };
+      }
+      // Other errors like invalid_request_error mean the key is valid
+      return { valid: true };
+    }
+
+    return { valid: false, error: parseApiError(data) || `API error: ${response.status}` };
+  } catch (error) {
+    return { valid: false, error: `Connection error: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+/**
+ * Validate OpenAI API key by making a minimal chat completion request
+ */
+async function validateOpenAIKey(apiKey: string): Promise<{ valid: boolean; error?: string }> {
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (response.ok) {
+      return { valid: true };
+    }
+
+    // Authentication error
+    if (response.status === 401) {
+      return { valid: false, error: 'Invalid API key' };
+    }
+
+    // Rate limit - key is valid
+    if (response.status === 429) {
+      return { valid: true };
+    }
+
+    // Model not found or bad request but auth passed - key is valid
+    if (response.status === 400 || response.status === 404) {
+      const errorCode = (data as { error?: { code?: string } })?.error?.code;
+      if (errorCode === 'invalid_api_key') {
+        return { valid: false, error: 'Invalid API key' };
+      }
+      return { valid: true };
+    }
+
+    return { valid: false, error: parseApiError(data) || `API error: ${response.status}` };
+  } catch (error) {
+    return { valid: false, error: `Connection error: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+/**
+ * Validate Google (Gemini) API key by making a minimal generate content request
+ */
+async function validateGoogleKey(apiKey: string): Promise<{ valid: boolean; error?: string }> {
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: 'hi' }] }],
+          generationConfig: { maxOutputTokens: 1 },
+        }),
+      }
+    );
+
+    const data = await response.json().catch(() => ({}));
+
+    if (response.ok) {
+      return { valid: true };
+    }
+
+    // Authentication error
+    if (response.status === 400 || response.status === 401 || response.status === 403) {
+      const errorStatus = (data as { error?: { status?: string } })?.error?.status;
+      if (errorStatus === 'UNAUTHENTICATED' || errorStatus === 'PERMISSION_DENIED') {
+        return { valid: false, error: 'Invalid API key' };
+      }
+      // Check if it's actually an auth error
+      const errorMessage = parseApiError(data).toLowerCase();
+      if (errorMessage.includes('api key') || errorMessage.includes('invalid') || errorMessage.includes('unauthorized')) {
+        return { valid: false, error: parseApiError(data) };
+      }
+      // Other errors mean key is valid
+      return { valid: true };
+    }
+
+    // Rate limit - key is valid
+    if (response.status === 429) {
+      return { valid: true };
+    }
+
+    return { valid: false, error: parseApiError(data) || `API error: ${response.status}` };
+  } catch (error) {
+    return { valid: false, error: `Connection error: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+/**
+ * Validate OpenRouter API key by making a minimal chat completion request
+ */
+async function validateOpenRouterKey(apiKey: string): Promise<{ valid: boolean; error?: string }> {
+  try {
+    // Use a popular free model for validation
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://clawx.app',
+        'X-Title': 'ClawX',
+      },
+      body: JSON.stringify({
+        model: 'meta-llama/llama-3.2-3b-instruct:free',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    const data = await response.json().catch(() => ({}));
+    console.log('OpenRouter validation response:', response.status, JSON.stringify(data));
+
+    // Helper to check if error message indicates auth failure
+    const isAuthError = (d: unknown): boolean => {
+      const errorObj = (d as { error?: { message?: string; code?: number | string; type?: string } })?.error;
+      if (!errorObj) return false;
+      
+      const message = (errorObj.message || '').toLowerCase();
+      const code = errorObj.code;
+      const type = (errorObj.type || '').toLowerCase();
+      
+      // Check for explicit auth-related errors
+      if (code === 401 || code === '401' || code === 403 || code === '403') return true;
+      if (type.includes('auth') || type.includes('invalid')) return true;
+      if (message.includes('invalid api key') || message.includes('invalid key') || 
+          message.includes('unauthorized') || message.includes('authentication') ||
+          message.includes('invalid credentials') || message.includes('api key is not valid')) {
+        return true;
+      }
+      return false;
+    };
+
+    if (response.ok) {
+      return { valid: true };
+    }
+
+    // Always check for auth errors in the response body first
+    if (isAuthError(data)) {
+      // Return user-friendly message instead of raw API errors like "User not found."
+      return { valid: false, error: 'Invalid API key' };
+    }
+
+    // Authentication error status codes - always return user-friendly message
+    if (response.status === 401 || response.status === 403) {
+      return { valid: false, error: 'Invalid API key' };
+    }
+
+    // Rate limit - key is valid
+    if (response.status === 429) {
+      return { valid: true };
+    }
+
+    // Payment required or insufficient credits - key format is valid
+    if (response.status === 402) {
+      return { valid: true };
+    }
+
+    // For 400/404, we must be very careful - only consider valid if clearly not an auth issue
+    if (response.status === 400 || response.status === 404) {
+      // If we got here without detecting auth error, it might be a model issue
+      // But be conservative - require explicit success indication
+      const errorObj = (data as { error?: { message?: string; code?: number } })?.error;
+      const message = (errorObj?.message || '').toLowerCase();
+      
+      // Only consider valid if the error is clearly about the model, not the key
+      if (message.includes('model') && !message.includes('key') && !message.includes('auth')) {
+        return { valid: true };
+      }
+      
+      // Default to invalid for ambiguous 400/404 errors
+      return { valid: false, error: parseApiError(data) || 'Invalid API key or request' };
+    }
+
+    return { valid: false, error: parseApiError(data) || `API error: ${response.status}` };
+  } catch (error) {
+    return { valid: false, error: `Connection error: ${error instanceof Error ? error.message : String(error)}` };
+  }
 }
 
 /**
