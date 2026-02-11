@@ -947,6 +947,8 @@ async function validateApiKeyWithProvider(
         return await validateMoonshotKey(trimmedKey);
       case 'siliconflow':
         return await validateSiliconFlowKey(trimmedKey);
+      case 'minimax':
+        return await validateMinimaxKey(trimmedKey);
       case 'ollama':
         // Ollama doesn't require API key validation
         return { valid: true };
@@ -1122,6 +1124,35 @@ async function validateSiliconFlowKey(apiKey: string): Promise<{ valid: boolean;
     logValidationRequest('siliconflow', 'GET', url, headers);
     const response = await fetch(url, { headers });
     logValidationStatus('siliconflow', response.status);
+    const data = await response.json().catch(() => ({}));
+    return classifyAuthResponse(response.status, data);
+  } catch (error) {
+    return { valid: false, error: `Connection error: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+/**
+ * Validate MiniMax API key via POST /v1/chat/completions (MiniMax does not support GET /v1/models).
+ * Uses a minimal request with max_tokens=1 to minimize cost.
+ */
+async function validateMinimaxKey(apiKey: string): Promise<{ valid: boolean; error?: string }> {
+  try {
+    const url = 'https://api.minimaxi.com/v1/chat/completions';
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    };
+    logValidationRequest('minimax', 'POST', url, headers);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: 'MiniMax-M2.1-lightning',
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    logValidationStatus('minimax', response.status);
     const data = await response.json().catch(() => ({}));
     return classifyAuthResponse(response.status, data);
   } catch (error) {

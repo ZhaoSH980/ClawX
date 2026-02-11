@@ -12,6 +12,7 @@ export const BUILTIN_PROVIDER_TYPES = [
   'openrouter',
   'moonshot',
   'siliconflow',
+  'minimax',
   'ollama',
 ] as const;
 export type BuiltinProviderType = (typeof BUILTIN_PROVIDER_TYPES)[number];
@@ -55,7 +56,7 @@ const REGISTRY: Record<string, ProviderBackendMeta> = {
     defaultModel: 'google/gemini-3-pro-preview',
     providerConfig: {
       baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-      api: 'google',
+      api: 'google-generative-ai',
       apiKeyEnv: 'GEMINI_API_KEY',
     },
   },
@@ -95,6 +96,15 @@ const REGISTRY: Record<string, ProviderBackendMeta> = {
       baseUrl: 'https://api.siliconflow.com/v1',
       api: 'openai-completions',
       apiKeyEnv: 'SILICONFLOW_API_KEY',
+    },
+  },
+  minimax: {
+    envVar: 'MINIMAX_API_KEY',
+    defaultModel: 'minimax/MiniMax-M2.1',
+    providerConfig: {
+      baseUrl: 'https://api.minimaxi.com/v1',
+      api: 'openai-completions',
+      apiKeyEnv: 'MINIMAX_API_KEY',
     },
   },
   // Additional providers with env var mappings but no default model

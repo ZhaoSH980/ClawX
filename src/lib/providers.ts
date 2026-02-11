@@ -12,6 +12,7 @@ export const PROVIDER_TYPES = [
   'openrouter',
   'moonshot',
   'siliconflow',
+  'minimax',
   'ollama',
   'custom',
 ] as const;
@@ -61,6 +62,7 @@ export const PROVIDER_TYPE_INFO: ProviderTypeInfo[] = [
   { id: 'openrouter', name: 'OpenRouter', icon: '🌐', placeholder: 'sk-or-v1-...', model: 'Multi-Model', requiresApiKey: true },
   { id: 'moonshot', name: 'Moonshot', icon: '🌙', placeholder: 'sk-...', model: 'Kimi', requiresApiKey: true, defaultBaseUrl: 'https://api.moonshot.cn/v1', defaultModelId: 'kimi-k2.5' },
   { id: 'siliconflow', name: 'SiliconFlow', icon: '🌊', placeholder: 'sk-...', model: 'Multi-Model', requiresApiKey: true, defaultBaseUrl: 'https://api.siliconflow.com/v1', defaultModelId: 'moonshotai/Kimi-K2.5' },
+  { id: 'minimax', name: 'MiniMax', icon: '🔮', placeholder: 'eyJhbG...', model: 'MiniMax-M2.1', requiresApiKey: true, defaultBaseUrl: 'https://api.minimaxi.com/v1', defaultModelId: 'MiniMax-M2.1' },
   { id: 'ollama', name: 'Ollama', icon: '🦙', placeholder: 'Not required', requiresApiKey: false, defaultBaseUrl: 'http://localhost:11434', showBaseUrl: true, showModelId: true, modelIdPlaceholder: 'qwen3:latest' },
   { id: 'custom', name: 'Custom', icon: '⚙️', placeholder: 'API key...', requiresApiKey: true, showBaseUrl: true, showModelId: true, modelIdPlaceholder: 'your-provider/model-id' },
 ];
