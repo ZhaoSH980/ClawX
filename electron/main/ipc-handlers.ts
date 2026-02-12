@@ -207,7 +207,7 @@ function registerCronHandlers(gatewayManager: GatewayManager): void {
     }
   });
 
-  // Create a new cron job
+  // Create a new cron job (with duplicate protection)
   ipcMain.handle('cron:create', async (_, input: {
     name: string;
     message: string;
@@ -216,6 +216,29 @@ function registerCronHandlers(gatewayManager: GatewayManager): void {
     enabled?: boolean;
   }) => {
     try {
+      // --- Duplicate protection ---
+      // Prevent creating jobs with the same name to guard against AI agents
+      // autonomously creating duplicate cron jobs without user request.
+      try {
+        const existing = await gatewayManager.rpc('cron.list', { includeDisabled: true });
+        const existingData = existing as { jobs?: GatewayCronJob[] };
+        const existingJobs = existingData?.jobs ?? [];
+        const normalizedName = input.name.trim().toLowerCase();
+        const duplicate = existingJobs.find(
+          (j) => j.name?.trim().toLowerCase() === normalizedName
+        );
+        if (duplicate) {
+          console.warn(`Blocked duplicate cron job creation: "${input.name}" (existing id: ${duplicate.id})`);
+          throw new Error(`A cron job with the name "${input.name}" already exists. Please use a different name or update the existing job.`);
+        }
+      } catch (dupError) {
+        // Re-throw if it's our duplicate error; swallow list failures so creation still works
+        if (dupError instanceof Error && dupError.message.includes('already exists')) {
+          throw dupError;
+        }
+        console.warn('Could not check for duplicate cron jobs:', dupError);
+      }
+
       // Transform frontend input to Gateway cron.add format
       // For Discord, the recipient must be prefixed with "channel:" or "user:"
       const recipientId = input.target.channelId;
