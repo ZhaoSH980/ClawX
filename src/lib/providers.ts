@@ -54,18 +54,30 @@ export interface ProviderTypeInfo {
   defaultModelId?: string;
 }
 
+import { providerIcons } from '@/assets/providers';
+
 /** All supported provider types with UI metadata */
 export const PROVIDER_TYPE_INFO: ProviderTypeInfo[] = [
   { id: 'anthropic', name: 'Anthropic', icon: '🤖', placeholder: 'sk-ant-api03-...', model: 'Claude', requiresApiKey: true },
   { id: 'openai', name: 'OpenAI', icon: '💚', placeholder: 'sk-proj-...', model: 'GPT', requiresApiKey: true },
   { id: 'google', name: 'Google', icon: '🔷', placeholder: 'AIza...', model: 'Gemini', requiresApiKey: true },
   { id: 'openrouter', name: 'OpenRouter', icon: '🌐', placeholder: 'sk-or-v1-...', model: 'Multi-Model', requiresApiKey: true },
-  { id: 'moonshot', name: 'Moonshot', icon: '🌙', placeholder: 'sk-...', model: 'Kimi', requiresApiKey: true, defaultBaseUrl: 'https://api.moonshot.cn/v1', defaultModelId: 'kimi-k2.5' },
-  { id: 'siliconflow', name: 'SiliconFlow', icon: '🌊', placeholder: 'sk-...', model: 'Multi-Model', requiresApiKey: true, defaultBaseUrl: 'https://api.siliconflow.com/v1', defaultModelId: 'moonshotai/Kimi-K2.5' },
+  { id: 'moonshot', name: 'Moonshot (CN)', icon: '🌙', placeholder: 'sk-...', model: 'Kimi', requiresApiKey: true, defaultBaseUrl: 'https://api.moonshot.cn/v1', defaultModelId: 'kimi-k2.5' },
+  { id: 'siliconflow', name: 'SiliconFlow (CN)', icon: '🌊', placeholder: 'sk-...', model: 'Multi-Model', requiresApiKey: true, defaultBaseUrl: 'https://api.siliconflow.cn/v1', defaultModelId: 'Pro/moonshotai/Kimi-K2.5' },
   { id: 'minimax', name: 'MiniMax', icon: '🔮', placeholder: 'eyJhbG...', model: 'MiniMax-M2.1', requiresApiKey: true, defaultBaseUrl: 'https://api.minimaxi.com/v1', defaultModelId: 'MiniMax-M2.1' },
   { id: 'ollama', name: 'Ollama', icon: '🦙', placeholder: 'Not required', requiresApiKey: false, defaultBaseUrl: 'http://localhost:11434', showBaseUrl: true, showModelId: true, modelIdPlaceholder: 'qwen3:latest' },
   { id: 'custom', name: 'Custom', icon: '⚙️', placeholder: 'API key...', requiresApiKey: true, showBaseUrl: true, showModelId: true, modelIdPlaceholder: 'your-provider/model-id' },
 ];
+
+/** Get the SVG logo URL for a provider type, falls back to undefined */
+export function getProviderIconUrl(type: ProviderType | string): string | undefined {
+  return providerIcons[type];
+}
+
+/** Whether a provider's logo needs CSS invert in dark mode (all logos are monochrome) */
+export function shouldInvertInDark(_type: ProviderType | string): boolean {
+  return true;
+}
 
 /** Provider list shown in the Setup wizard */
 export const SETUP_PROVIDERS = PROVIDER_TYPE_INFO;

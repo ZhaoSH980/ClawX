@@ -119,7 +119,8 @@ jobs:
             release/*.AppImage
             release/*.deb
             release/*.rpm
-            release/latest*.yml
+            release/*.yml
+            !release/builder-debug.yml
           retention-days: 7
 
   # ──────────────────────────────────────────────────────────────
@@ -146,6 +147,11 @@ jobs:
           echo "=== File tree ==="
           tree release-artifacts/ || find release-artifacts/ -print
 
+      - name: Remove duplicate builder-debug files
+        run: |
+          echo "Removing builder-debug.yml files to avoid duplicate asset upload conflicts..."
+          find release-artifacts/ -name "builder-debug.yml" -delete -print || true
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
@@ -157,7 +163,7 @@ jobs:
             release-artifacts/**/*.AppImage
             release-artifacts/**/*.deb
             release-artifacts/**/*.rpm
-            release-artifacts/**/latest*.yml
+            release-artifacts/**/*.yml
           draft: false
           prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
           make_latest: ${{ !(contains(github.ref, 'alpha') || contains(github.ref, 'beta')) }}
@@ -206,10 +212,12 @@ jobs:
   # Job: Upload to Alibaba Cloud OSS
   # Uploads all release artifacts to OSS for:
   #   - Official website downloads (via release-info.json)
-  #   - electron-updater auto-update (via latest-*.yml)
+  #   - electron-updater auto-update (via {channel}-*.yml)
   #
-  # Directory structure on OSS:
-  #   latest/          → always overwritten with the newest version
+  # Directory structure on OSS (channel-separated):
+  #   latest/          → stable releases (latest.yml, latest-mac.yml, …)
+  #   alpha/           → alpha  releases (alpha.yml,  alpha-mac.yml, …)
+  #   beta/            → beta   releases (beta.yml,   beta-mac.yml,  …)
   #   releases/vX.Y.Z/ → permanent archive, never deleted
   # ──────────────────────────────────────────────────────────────
   upload-oss:
@@ -225,7 +233,7 @@ jobs:
         with:
           path: release-artifacts
 
-      - name: Extract version
+      - name: Extract version and channel
         id: version
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
@@ -233,43 +241,66 @@ jobs:
           else
             VERSION="${{ github.event.inputs.version }}"
           fi
+
+          # Detect channel from semver prerelease tag
+          # e.g. 0.1.8-alpha.0 → alpha, 1.0.0-beta.1 → beta, 1.0.0 → latest
+          if [[ "$VERSION" =~ -([a-zA-Z]+) ]]; then
+            CHANNEL="${BASH_REMATCH[1]}"
+          else
+            CHANNEL="latest"
+          fi
+
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
-          echo "Detected version: ${VERSION}"
+          echo "channel=${CHANNEL}" >> $GITHUB_OUTPUT
+          echo "Detected version: ${VERSION}, channel: ${CHANNEL}"
 
       - name: Prepare upload directories
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           TAG="${{ steps.version.outputs.tag }}"
+          CHANNEL="${{ steps.version.outputs.channel }}"
 
-          mkdir -p staging/latest
+          mkdir -p staging/${CHANNEL}
           mkdir -p staging/releases/${TAG}
 
           # Flatten all platform artifacts into staging directories
           find release-artifacts/ -type f | while read file; do
             filename=$(basename "$file")
-            cp "$file" "staging/latest/${filename}"
+            cp "$file" "staging/${CHANNEL}/${filename}"
             cp "$file" "staging/releases/${TAG}/${filename}"
           done
 
-          echo "=== staging/latest/ ==="
-          ls -lh staging/latest/
+          echo "=== staging/${CHANNEL}/ ==="
+          ls -lh staging/${CHANNEL}/
           echo ""
           echo "=== staging/releases/${TAG}/ ==="
           ls -lh staging/releases/${TAG}/
 
+      # Note: Do NOT rename yml files. electron-updater (generic provider) always
+      # requests "latest-mac.yml", "latest.yml", etc. regardless of feed URL.
+      # Channel separation is achieved by directory: /alpha/, /beta/, /latest/.
+      - name: Verify yml files present
+        run: |
+          CHANNEL="${{ steps.version.outputs.channel }}"
+          echo "=== staging/${CHANNEL}/ (update metadata) ==="
+          ls -la staging/${CHANNEL}/*.yml 2>/dev/null || echo "No yml files found (check electron-builder outputs)"
+
       - name: Generate release-info.json
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          BASE_URL="https://oss.intelli-spectrum.com/latest"
+          CHANNEL="${{ steps.version.outputs.channel }}"
+          BASE_URL="https://oss.intelli-spectrum.com/${CHANNEL}"
 
           jq -n \
             --arg version "$VERSION" \
+            --arg channel "$CHANNEL" \
             --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg base "$BASE_URL" \
             --arg changelog "https://github.com/${{ github.repository }}/releases/tag/v${VERSION}" \
             '{
               version: $version,
+              channel: $channel,
               releaseDate: $date,
               downloads: {
                 mac: {
@@ -289,10 +320,10 @@ jobs:
                 }
               },
               changelog: $changelog
-            }' > staging/latest/release-info.json
+            }' > staging/${CHANNEL}/release-info.json
 
           echo "=== release-info.json ==="
-          cat staging/latest/release-info.json
+          cat staging/${CHANNEL}/release-info.json
 
       - name: Install and configure ossutil
         env:
@@ -312,18 +343,20 @@ jobs:
 
           ossutil --version
 
-      - name: "Upload to OSS: latest/ (overwrite)"
+      - name: "Upload to OSS: {channel}/ (overwrite)"
         run: |
-          # Clean old latest/ to remove stale version files
-          ossutil rm -r -f oss://valuecell-clawx/latest/ || true
+          CHANNEL="${{ steps.version.outputs.channel }}"
+
+          # Only clean the current channel's directory — never touch other channels
+          ossutil rm -r -f oss://valuecell-clawx/${CHANNEL}/ || true
 
           # Upload all files with no-cache so clients always get the freshest version
           ossutil cp -r -f \
             --meta="Cache-Control:no-cache,no-store,must-revalidate" \
-            staging/latest/ \
-            oss://valuecell-clawx/latest/
+            staging/${CHANNEL}/ \
+            oss://valuecell-clawx/${CHANNEL}/
 
-          echo "Uploaded to latest/"
+          echo "Uploaded to ${CHANNEL}/"
 
       - name: "Upload to OSS: releases/vX.Y.Z/ (archive)"
         run: |
@@ -340,9 +373,10 @@ jobs:
       - name: Verify OSS upload
         run: |
           TAG="${{ steps.version.outputs.tag }}"
+          CHANNEL="${{ steps.version.outputs.channel }}"
 
-          echo "=== latest/ ==="
-          ossutil ls oss://valuecell-clawx/latest/ --short
+          echo "=== ${CHANNEL}/ ==="
+          ossutil ls oss://valuecell-clawx/${CHANNEL}/ --short
 
           echo ""
           echo "=== releases/${TAG}/ ==="
@@ -350,8 +384,18 @@ jobs:
 
           echo ""
           echo "=== Verify release-info.json ==="
-          ossutil cp oss://valuecell-clawx/latest/release-info.json /tmp/release-info.json -f
+          ossutil cp oss://valuecell-clawx/${CHANNEL}/release-info.json /tmp/release-info.json -f
           jq . /tmp/release-info.json
+
+          echo ""
+          echo "=== Verify update yml ==="
+          if [ "${CHANNEL}" = "latest" ]; then
+            YML_PREFIX="latest"
+          else
+            YML_PREFIX="${CHANNEL}"
+          fi
+          echo "electron-updater expects ${YML_PREFIX}-mac.yml, ${YML_PREFIX}.yml, etc. in ${CHANNEL}/:"
+          ossutil ls oss://valuecell-clawx/${CHANNEL}/ --short | grep "${YML_PREFIX}.*\\.yml" || echo "(none found)"
           
           echo ""
-          echo "✅ All files uploaded and verified successfully!"
+          echo "All files uploaded and verified successfully!"

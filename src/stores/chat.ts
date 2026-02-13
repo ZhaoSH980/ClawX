@@ -14,17 +14,21 @@ export interface RawMessage {
   timestamp?: number;
   id?: string;
   toolCallId?: string;
+  toolName?: string;
+  details?: unknown;
+  isError?: boolean;
 }
 
 /** Content block inside a message */
 export interface ContentBlock {
-  type: 'text' | 'image' | 'thinking' | 'tool_use' | 'tool_result';
+  type: 'text' | 'image' | 'thinking' | 'tool_use' | 'tool_result' | 'toolCall' | 'toolResult';
   text?: string;
   thinking?: string;
   source?: { type: string; media_type: string; data: string };
   id?: string;
   name?: string;
   input?: unknown;
+  arguments?: unknown;
   content?: unknown;
 }
 
@@ -35,6 +39,16 @@ export interface ChatSession {
   displayName?: string;
   thinkingLevel?: string;
   model?: string;
+}
+
+export interface ToolStatus {
+  id?: string;
+  toolCallId?: string;
+  name: string;
+  status: 'running' | 'completed' | 'error';
+  durationMs?: number;
+  summary?: string;
+  updatedAt: number;
 }
 
 interface ChatState {
@@ -48,6 +62,9 @@ interface ChatState {
   activeRunId: string | null;
   streamingText: string;
   streamingMessage: unknown | null;
+  streamingTools: ToolStatus[];
+  pendingFinal: boolean;
+  lastUserMessageAt: number | null;
 
   // Sessions
   sessions: ChatSession[];
@@ -70,9 +87,20 @@ interface ChatState {
   clearError: () => void;
 }
 
+const DEFAULT_CANONICAL_PREFIX = 'agent:main';
+const DEFAULT_SESSION_KEY = `${DEFAULT_CANONICAL_PREFIX}:main`;
+
+function getCanonicalPrefixFromSessions(sessions: ChatSession[]): string | null {
+  const canonical = sessions.find((s) => s.key.startsWith('agent:'))?.key;
+  if (!canonical) return null;
+  const parts = canonical.split(':');
+  if (parts.length < 2) return null;
+  return `${parts[0]}:${parts[1]}`;
+}
+
 function isToolOnlyMessage(message: RawMessage | undefined): boolean {
   if (!message) return false;
-  if (message.role === 'toolresult') return true;
+  if (isToolResultRole(message.role)) return true;
 
   const content = message.content;
   if (!Array.isArray(content)) return false;
@@ -82,7 +110,7 @@ function isToolOnlyMessage(message: RawMessage | undefined): boolean {
   let hasNonToolContent = false;
 
   for (const block of content as ContentBlock[]) {
-    if (block.type === 'tool_use' || block.type === 'tool_result') {
+    if (block.type === 'tool_use' || block.type === 'tool_result' || block.type === 'toolCall' || block.type === 'toolResult') {
       hasTool = true;
       continue;
     }
@@ -98,6 +126,186 @@ function isToolOnlyMessage(message: RawMessage | undefined): boolean {
   return hasTool && !hasText && !hasNonToolContent;
 }
 
+function isToolResultRole(role: unknown): boolean {
+  if (!role) return false;
+  const normalized = String(role).toLowerCase();
+  return normalized === 'toolresult' || normalized === 'tool_result';
+}
+
+function extractTextFromContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content as ContentBlock[]) {
+    if (block.type === 'text' && block.text) {
+      parts.push(block.text);
+    }
+  }
+  return parts.join('\n');
+}
+
+function summarizeToolOutput(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) return undefined;
+  const summaryLines = lines.slice(0, 2);
+  let summary = summaryLines.join(' / ');
+  if (summary.length > 160) {
+    summary = `${summary.slice(0, 157)}...`;
+  }
+  return summary;
+}
+
+function normalizeToolStatus(rawStatus: unknown, fallback: 'running' | 'completed'): ToolStatus['status'] {
+  const status = typeof rawStatus === 'string' ? rawStatus.toLowerCase() : '';
+  if (status === 'error' || status === 'failed') return 'error';
+  if (status === 'completed' || status === 'success' || status === 'done') return 'completed';
+  return fallback;
+}
+
+function parseDurationMs(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const parsed = typeof value === 'string' ? Number(value) : NaN;
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function extractToolUseUpdates(message: unknown): ToolStatus[] {
+  if (!message || typeof message !== 'object') return [];
+  const msg = message as Record<string, unknown>;
+  const content = msg.content;
+  if (!Array.isArray(content)) return [];
+
+  const updates: ToolStatus[] = [];
+  for (const block of content as ContentBlock[]) {
+    if ((block.type !== 'tool_use' && block.type !== 'toolCall') || !block.name) continue;
+    updates.push({
+      id: block.id || block.name,
+      toolCallId: block.id,
+      name: block.name,
+      status: 'running',
+      updatedAt: Date.now(),
+    });
+  }
+
+  return updates;
+}
+
+function extractToolResultBlocks(message: unknown, eventState: string): ToolStatus[] {
+  if (!message || typeof message !== 'object') return [];
+  const msg = message as Record<string, unknown>;
+  const content = msg.content;
+  if (!Array.isArray(content)) return [];
+
+  const updates: ToolStatus[] = [];
+  for (const block of content as ContentBlock[]) {
+    if (block.type !== 'tool_result' && block.type !== 'toolResult') continue;
+    const outputText = extractTextFromContent(block.content ?? block.text ?? '');
+    const summary = summarizeToolOutput(outputText);
+    updates.push({
+      id: block.id || block.name || 'tool',
+      toolCallId: block.id,
+      name: block.name || block.id || 'tool',
+      status: normalizeToolStatus(undefined, eventState === 'delta' ? 'running' : 'completed'),
+      summary,
+      updatedAt: Date.now(),
+    });
+  }
+
+  return updates;
+}
+
+function extractToolResultUpdate(message: unknown, eventState: string): ToolStatus | null {
+  if (!message || typeof message !== 'object') return null;
+  const msg = message as Record<string, unknown>;
+  const role = typeof msg.role === 'string' ? msg.role.toLowerCase() : '';
+  if (!isToolResultRole(role)) return null;
+
+  const toolName = typeof msg.toolName === 'string' ? msg.toolName : (typeof msg.name === 'string' ? msg.name : '');
+  const toolCallId = typeof msg.toolCallId === 'string' ? msg.toolCallId : undefined;
+  const details = (msg.details && typeof msg.details === 'object') ? msg.details as Record<string, unknown> : undefined;
+  const rawStatus = (msg.status ?? details?.status);
+  const fallback = eventState === 'delta' ? 'running' : 'completed';
+  const status = normalizeToolStatus(rawStatus, fallback);
+  const durationMs = parseDurationMs(details?.durationMs ?? details?.duration ?? (msg as Record<string, unknown>).durationMs);
+
+  const outputText = (details && typeof details.aggregated === 'string')
+    ? details.aggregated
+    : extractTextFromContent(msg.content);
+  const summary = summarizeToolOutput(outputText) ?? summarizeToolOutput(String(details?.error ?? msg.error ?? ''));
+
+  const name = toolName || toolCallId || 'tool';
+  const id = toolCallId || name;
+
+  return {
+    id,
+    toolCallId,
+    name,
+    status,
+    durationMs,
+    summary,
+    updatedAt: Date.now(),
+  };
+}
+
+function mergeToolStatus(existing: ToolStatus['status'], incoming: ToolStatus['status']): ToolStatus['status'] {
+  const order: Record<ToolStatus['status'], number> = { running: 0, completed: 1, error: 2 };
+  return order[incoming] >= order[existing] ? incoming : existing;
+}
+
+function upsertToolStatuses(current: ToolStatus[], updates: ToolStatus[]): ToolStatus[] {
+  if (updates.length === 0) return current;
+  const next = [...current];
+  for (const update of updates) {
+    const key = update.toolCallId || update.id || update.name;
+    if (!key) continue;
+    const index = next.findIndex((tool) => (tool.toolCallId || tool.id || tool.name) === key);
+    if (index === -1) {
+      next.push(update);
+      continue;
+    }
+    const existing = next[index];
+    next[index] = {
+      ...existing,
+      ...update,
+      name: update.name || existing.name,
+      status: mergeToolStatus(existing.status, update.status),
+      durationMs: update.durationMs ?? existing.durationMs,
+      summary: update.summary ?? existing.summary,
+      updatedAt: update.updatedAt || existing.updatedAt,
+    };
+  }
+  return next;
+}
+
+function collectToolUpdates(message: unknown, eventState: string): ToolStatus[] {
+  const updates: ToolStatus[] = [];
+  const toolResultUpdate = extractToolResultUpdate(message, eventState);
+  if (toolResultUpdate) updates.push(toolResultUpdate);
+  updates.push(...extractToolResultBlocks(message, eventState));
+  updates.push(...extractToolUseUpdates(message));
+  return updates;
+}
+
+function hasNonToolAssistantContent(message: RawMessage | undefined): boolean {
+  if (!message) return false;
+  if (typeof message.content === 'string' && message.content.trim()) return true;
+
+  const content = message.content;
+  if (Array.isArray(content)) {
+    for (const block of content as ContentBlock[]) {
+      if (block.type === 'text' && block.text && block.text.trim()) return true;
+      if (block.type === 'thinking' && block.thinking && block.thinking.trim()) return true;
+      if (block.type === 'image') return true;
+    }
+  }
+
+  const msg = message as unknown as Record<string, unknown>;
+  if (typeof msg.text === 'string' && msg.text.trim()) return true;
+
+  return false;
+}
+
 // ── Store ────────────────────────────────────────────────────────
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -109,9 +317,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
   activeRunId: null,
   streamingText: '',
   streamingMessage: null,
+  streamingTools: [],
+  pendingFinal: false,
+  lastUserMessageAt: null,
 
   sessions: [],
-  currentSessionKey: 'main',
+  currentSessionKey: DEFAULT_SESSION_KEY,
 
   showThinking: true,
   thinkingLevel: null,
@@ -137,33 +348,49 @@ export const useChatStore = create<ChatState>((set, get) => ({
           model: s.model ? String(s.model) : undefined,
         })).filter((s: ChatSession) => s.key);
 
-        // Normalize: the Gateway returns the main session with canonical key
-        // like "agent:main:main", but the frontend uses "main" for all RPC calls.
-        // Map the canonical main session key to "main" so the selector stays consistent.
-        const mainCanonicalPattern = /^agent:[^:]+:main$/;
-        const normalizedSessions = sessions.map((s) => {
-          if (mainCanonicalPattern.test(s.key)) {
-            return { ...s, key: 'main', displayName: s.displayName || 'main' };
+        const canonicalBySuffix = new Map<string, string>();
+        for (const session of sessions) {
+          if (!session.key.startsWith('agent:')) continue;
+          const parts = session.key.split(':');
+          if (parts.length < 3) continue;
+          const suffix = parts.slice(2).join(':');
+          if (suffix && !canonicalBySuffix.has(suffix)) {
+            canonicalBySuffix.set(suffix, session.key);
           }
-          return s;
-        });
+        }
 
-        // Deduplicate: if both "main" and "agent:X:main" existed, keep only one
+        // Deduplicate: if both short and canonical existed, keep canonical only
         const seen = new Set<string>();
-        const dedupedSessions = normalizedSessions.filter((s) => {
+        const dedupedSessions = sessions.filter((s) => {
+          if (!s.key.startsWith('agent:') && canonicalBySuffix.has(s.key)) return false;
           if (seen.has(s.key)) return false;
           seen.add(s.key);
           return true;
         });
 
-        set({ sessions: dedupedSessions });
-
-        // If currentSessionKey is 'main' and we now have sessions,
-        // ensure we stay on 'main' (no-op, but load history if needed)
         const { currentSessionKey } = get();
-        if (currentSessionKey === 'main' && !dedupedSessions.find((s) => s.key === 'main') && dedupedSessions.length > 0) {
-          // Main session not found at all — switch to the first available session
-          set({ currentSessionKey: dedupedSessions[0].key });
+        let nextSessionKey = currentSessionKey || DEFAULT_SESSION_KEY;
+        if (!nextSessionKey.startsWith('agent:')) {
+          const canonicalMatch = canonicalBySuffix.get(nextSessionKey);
+          if (canonicalMatch) {
+            nextSessionKey = canonicalMatch;
+          }
+        }
+        if (!dedupedSessions.find((s) => s.key === nextSessionKey) && dedupedSessions.length > 0) {
+          // Current session not found at all — switch to the first available session
+          nextSessionKey = dedupedSessions[0].key;
+        }
+
+        const sessionsWithCurrent = !dedupedSessions.find((s) => s.key === nextSessionKey) && nextSessionKey
+          ? [
+            ...dedupedSessions,
+            { key: nextSessionKey, displayName: nextSessionKey },
+          ]
+          : dedupedSessions;
+
+        set({ sessions: sessionsWithCurrent, currentSessionKey: nextSessionKey });
+
+        if (currentSessionKey !== nextSessionKey) {
           get().loadHistory();
         }
       }
@@ -180,8 +407,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messages: [],
       streamingText: '',
       streamingMessage: null,
+      streamingTools: [],
       activeRunId: null,
       error: null,
+      pendingFinal: false,
+      lastUserMessageAt: null,
     });
     // Load history for new session
     get().loadHistory();
@@ -191,17 +421,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   newSession: () => {
     // Generate a new unique session key and switch to it
-    const newKey = `session-${Date.now()}`;
-    set({
+    const prefix = getCanonicalPrefixFromSessions(get().sessions) ?? DEFAULT_CANONICAL_PREFIX;
+    const newKey = `${prefix}:session-${Date.now()}`;
+    const newSessionEntry: ChatSession = { key: newKey, displayName: newKey };
+    set((s) => ({
       currentSessionKey: newKey,
+      sessions: [...s.sessions, newSessionEntry],
       messages: [],
       streamingText: '',
       streamingMessage: null,
+      streamingTools: [],
       activeRunId: null,
       error: null,
-    });
-    // Reload sessions list to include the new one after first message
-    get().loadSessions();
+      pendingFinal: false,
+      lastUserMessageAt: null,
+    }));
   },
 
   // ── Load chat history ──
@@ -220,8 +454,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (result.success && result.result) {
         const data = result.result;
         const rawMessages = Array.isArray(data.messages) ? data.messages as RawMessage[] : [];
+        const filteredMessages = rawMessages.filter((msg) => !isToolResultRole(msg.role));
         const thinkingLevel = data.thinkingLevel ? String(data.thinkingLevel) : null;
-        set({ messages: rawMessages, thinkingLevel, loading: false });
+        set({ messages: filteredMessages, thinkingLevel, loading: false });
+        const { pendingFinal, lastUserMessageAt } = get();
+        if (pendingFinal) {
+          const recentAssistant = [...filteredMessages].reverse().find((msg) => {
+            if (msg.role !== 'assistant') return false;
+            if (!hasNonToolAssistantContent(msg)) return false;
+            if (lastUserMessageAt && msg.timestamp && msg.timestamp < lastUserMessageAt) return false;
+            return true;
+          });
+          if (recentAssistant) {
+            set({ sending: false, activeRunId: null, pendingFinal: false });
+          }
+        }
       } else {
         set({ messages: [], loading: false });
       }
@@ -252,6 +499,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       error: null,
       streamingText: '',
       streamingMessage: null,
+      streamingTools: [],
+      pendingFinal: false,
+      lastUserMessageAt: userMsg.timestamp ?? null,
     }));
 
     try {
@@ -295,7 +545,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   abortRun: async () => {
     const { currentSessionKey } = get();
-    set({ sending: false, streamingText: '', streamingMessage: null });
+    set({ sending: false, streamingText: '', streamingMessage: null, pendingFinal: false, lastUserMessageAt: null });
+    set({ streamingTools: [] });
 
     try {
       await window.electron.ipcRenderer.invoke(
@@ -321,18 +572,38 @@ export const useChatStore = create<ChatState>((set, get) => ({
     switch (eventState) {
       case 'delta': {
         // Streaming update - store the cumulative message
-        set({
-          streamingMessage: event.message ?? get().streamingMessage,
-        });
+        const updates = collectToolUpdates(event.message, eventState);
+        set((s) => ({
+          streamingMessage: (() => {
+            if (event.message && typeof event.message === 'object') {
+              const msgRole = (event.message as RawMessage).role;
+              if (isToolResultRole(msgRole)) return s.streamingMessage;
+            }
+            return event.message ?? s.streamingMessage;
+          })(),
+          streamingTools: updates.length > 0 ? upsertToolStatuses(s.streamingTools, updates) : s.streamingTools,
+        }));
         break;
       }
       case 'final': {
         // Message complete - add to history and clear streaming
         const finalMsg = event.message as RawMessage | undefined;
         if (finalMsg) {
+          const updates = collectToolUpdates(finalMsg, eventState);
+          if (isToolResultRole(finalMsg.role)) {
+            set((s) => ({
+              streamingText: '',
+              pendingFinal: true,
+              streamingTools: updates.length > 0 ? upsertToolStatuses(s.streamingTools, updates) : s.streamingTools,
+            }));
+            break;
+          }
           const toolOnly = isToolOnlyMessage(finalMsg);
+          const hasOutput = hasNonToolAssistantContent(finalMsg);
           const msgId = finalMsg.id || (toolOnly ? `run-${runId}-tool-${Date.now()}` : `run-${runId}`);
           set((s) => {
+            const nextTools = updates.length > 0 ? upsertToolStatuses(s.streamingTools, updates) : s.streamingTools;
+            const streamingTools = hasOutput ? [] : nextTools;
             // Check if message already exists (prevent duplicates)
             const alreadyExists = s.messages.some(m => m.id === msgId);
             if (alreadyExists) {
@@ -340,11 +611,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
               return toolOnly ? {
                 streamingText: '',
                 streamingMessage: null,
+                pendingFinal: true,
+                streamingTools,
               } : {
                 streamingText: '',
                 streamingMessage: null,
-                sending: false,
-                activeRunId: null,
+                sending: hasOutput ? false : s.sending,
+                activeRunId: hasOutput ? null : s.activeRunId,
+                pendingFinal: hasOutput ? false : true,
+                streamingTools,
               };
             }
             return toolOnly ? {
@@ -355,6 +630,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
               }],
               streamingText: '',
               streamingMessage: null,
+              pendingFinal: true,
+              streamingTools,
             } : {
               messages: [...s.messages, {
                 ...finalMsg,
@@ -363,13 +640,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
               }],
               streamingText: '',
               streamingMessage: null,
-              sending: false,
-              activeRunId: null,
+              sending: hasOutput ? false : s.sending,
+              activeRunId: hasOutput ? null : s.activeRunId,
+              pendingFinal: hasOutput ? false : true,
+              streamingTools,
             };
           });
         } else {
           // No message in final event - reload history to get complete data
-          set({ streamingText: '', streamingMessage: null, sending: false, activeRunId: null });
+          set({ streamingText: '', streamingMessage: null, pendingFinal: true });
           get().loadHistory();
         }
         break;
@@ -382,6 +661,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           activeRunId: null,
           streamingText: '',
           streamingMessage: null,
+          streamingTools: [],
+          pendingFinal: false,
+          lastUserMessageAt: null,
         });
         break;
       }
@@ -391,6 +673,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           activeRunId: null,
           streamingText: '',
           streamingMessage: null,
+          streamingTools: [],
+          pendingFinal: false,
+          lastUserMessageAt: null,
         });
         break;
       }

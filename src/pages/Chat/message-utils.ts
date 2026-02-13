@@ -15,26 +15,25 @@ export function extractText(message: RawMessage | unknown): string {
   const content = msg.content;
 
   if (typeof content === 'string') {
-    return content;
+    return content.trim().length > 0 ? content : '';
   }
 
   if (Array.isArray(content)) {
     const parts: string[] = [];
     for (const block of content as ContentBlock[]) {
       if (block.type === 'text' && block.text) {
-        parts.push(block.text);
-      }
-      // tool_result blocks may have nested text
-      if (block.type === 'tool_result' && typeof block.content === 'string') {
-        parts.push(block.content);
+        if (block.text.trim().length > 0) {
+          parts.push(block.text);
+        }
       }
     }
-    return parts.join('\n\n');
+    const combined = parts.join('\n\n');
+    return combined.trim().length > 0 ? combined : '';
   }
 
   // Fallback: try .text field
   if (typeof msg.text === 'string') {
-    return msg.text;
+    return msg.text.trim().length > 0 ? msg.text : '';
   }
 
   return '';
@@ -54,11 +53,15 @@ export function extractThinking(message: RawMessage | unknown): string | null {
   const parts: string[] = [];
   for (const block of content as ContentBlock[]) {
     if (block.type === 'thinking' && block.thinking) {
-      parts.push(block.thinking);
+      const cleaned = block.thinking.trim();
+      if (cleaned) {
+        parts.push(cleaned);
+      }
     }
   }
 
-  return parts.length > 0 ? parts.join('\n\n') : null;
+  const combined = parts.join('\n\n').trim();
+  return combined.length > 0 ? combined : null;
 }
 
 /**
@@ -97,11 +100,11 @@ export function extractToolUse(message: RawMessage | unknown): Array<{ id: strin
 
   const tools: Array<{ id: string; name: string; input: unknown }> = [];
   for (const block of content as ContentBlock[]) {
-    if (block.type === 'tool_use' && block.name) {
+    if ((block.type === 'tool_use' || block.type === 'toolCall') && block.name) {
       tools.push({
         id: block.id || '',
         name: block.name,
-        input: block.input,
+        input: block.input ?? block.arguments,
       });
     }
   }
