@@ -14,6 +14,8 @@
         "newSession": "新会话",
         "refresh": "刷新聊天",
         "showThinking": "显示思考过程",
-        "hideThinking": "隐藏思考过程"
+        "hideThinking": "隐藏思考过程",
+        "clearHistory": "清除对话历史",
+        "clearHistoryConfirm": "确定要清除当前会话的所有对话历史吗？此操作不可撤销。"
     }
 }

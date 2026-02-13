@@ -78,6 +78,7 @@ interface ChatState {
   loadSessions: () => Promise<void>;
   switchSession: (key: string) => void;
   newSession: () => void;
+  clearHistory: () => Promise<void>;
   loadHistory: () => Promise<void>;
   sendMessage: (text: string, attachments?: { type: string; mimeType: string; fileName: string; content: string }[]) => Promise<void>;
   abortRun: () => Promise<void>;
@@ -436,6 +437,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
       pendingFinal: false,
       lastUserMessageAt: null,
     }));
+  },
+
+  // ── Clear chat history for current session ──
+
+  clearHistory: async () => {
+    const { currentSessionKey } = get();
+    try {
+      await window.electron.ipcRenderer.invoke(
+        'gateway:rpc',
+        'sessions.reset',
+        { key: currentSessionKey },
+      );
+      set({
+        messages: [],
+        streamingText: '',
+        streamingMessage: null,
+        streamingTools: [],
+        activeRunId: null,
+        error: null,
+        pendingFinal: false,
+        lastUserMessageAt: null,
+      });
+    } catch (err) {
+      console.warn('Failed to clear chat history:', err);
+      set({ error: String(err) });
+    }
   },
 
   // ── Load chat history ──

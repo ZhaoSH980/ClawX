@@ -100,7 +100,7 @@ const REGISTRY: Record<string, ProviderBackendMeta> = {
   },
   minimax: {
     envVar: 'MINIMAX_API_KEY',
-    defaultModel: 'minimax/MiniMax-M2.1',
+    defaultModel: 'minimax/MiniMax-M2.5',
     providerConfig: {
       baseUrl: 'https://api.minimaxi.com/v1',
       api: 'openai-completions',

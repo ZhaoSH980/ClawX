@@ -958,7 +958,7 @@ function registerProviderHandlers(): void {
   );
 }
 
-type ValidationProfile = 'openai-compatible' | 'google-query-key' | 'anthropic-header' | 'none';
+type ValidationProfile = 'openai-compatible' | 'google-query-key' | 'anthropic-header' | 'chat-completions-probe' | 'none';
 
 /**
  * Validate API key using lightweight model-listing endpoints (zero token cost).
@@ -990,6 +990,8 @@ async function validateApiKeyWithProvider(
         return await validateGoogleQueryKey(providerType, trimmedKey, options?.baseUrl);
       case 'anthropic-header':
         return await validateAnthropicHeaderKey(providerType, trimmedKey, options?.baseUrl);
+      case 'chat-completions-probe':
+        return await validateChatCompletionsProbe(providerType, trimmedKey, options?.baseUrl);
       default:
         return { valid: false, error: `Unsupported validation profile for provider: ${providerType}` };
     }
@@ -1057,6 +1059,10 @@ function getValidationProfile(providerType: string): ValidationProfile {
       return 'anthropic-header';
     case 'google':
       return 'google-query-key';
+    case 'minimax':
+      // MiniMax does not support the /models endpoint (returns 404).
+      // Use a lightweight /chat/completions probe instead.
+      return 'chat-completions-probe';
     case 'ollama':
       return 'none';
     default:
@@ -1116,6 +1122,58 @@ async function validateOpenAiCompatibleKey(
   const url = buildOpenAiModelsUrl(trimmedBaseUrl);
   const headers = { Authorization: `Bearer ${apiKey}` };
   return await performProviderValidationRequest(providerType, url, headers);
+}
+
+/**
+ * Validate API key via a minimal POST to /chat/completions with max_tokens=1.
+ * Used for providers (e.g. MiniMax) that do not expose a /models endpoint.
+ * The probe sends a tiny request; 401/403 → invalid key, 200/429/400 → valid key.
+ */
+async function validateChatCompletionsProbe(
+  providerType: string,
+  apiKey: string,
+  baseUrl?: string
+): Promise<{ valid: boolean; error?: string }> {
+  const trimmedBaseUrl = baseUrl?.trim();
+  if (!trimmedBaseUrl) {
+    return { valid: false, error: `Base URL is required for provider "${providerType}" validation` };
+  }
+
+  const url = `${normalizeBaseUrl(trimmedBaseUrl)}/chat/completions`;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+  };
+  // Minimal payload — we only care about the auth response, not the completion.
+  const body = JSON.stringify({
+    model: 'MiniMax-M2.5',
+    messages: [{ role: 'user', content: 'hi' }],
+    max_tokens: 1,
+  });
+
+  try {
+    logValidationRequest(providerType, 'POST', url, headers);
+    const response = await fetch(url, { method: 'POST', headers, body });
+    logValidationStatus(providerType, response.status);
+    const data = await response.json().catch(() => ({}));
+
+    // 401/403 → invalid key.  200/429 → valid key.
+    // 400 (bad request) also implies key is valid (auth passed, request was bad).
+    if (response.status === 401 || response.status === 403) {
+      return { valid: false, error: 'Invalid API key' };
+    }
+    if (response.status >= 200 && response.status < 300) return { valid: true };
+    if (response.status === 429 || response.status === 400) return { valid: true };
+
+    const obj = data as { error?: { message?: string }; message?: string } | null;
+    const msg = obj?.error?.message || obj?.message || `API error: ${response.status}`;
+    return { valid: false, error: msg };
+  } catch (error) {
+    return {
+      valid: false,
+      error: `Connection error: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 async function validateGoogleQueryKey(

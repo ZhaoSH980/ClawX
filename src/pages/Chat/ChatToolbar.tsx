@@ -3,7 +3,7 @@
  * Session selector, new session, refresh, and thinking toggle.
  * Rendered in the Header when on the Chat page.
  */
-import { RefreshCw, Brain, ChevronDown, Plus } from 'lucide-react';
+import { RefreshCw, Brain, ChevronDown, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useChatStore } from '@/stores/chat';
@@ -15,6 +15,8 @@ export function ChatToolbar() {
   const currentSessionKey = useChatStore((s) => s.currentSessionKey);
   const switchSession = useChatStore((s) => s.switchSession);
   const newSession = useChatStore((s) => s.newSession);
+  const clearHistory = useChatStore((s) => s.clearHistory);
+  const messages = useChatStore((s) => s.messages);
   const refresh = useChatStore((s) => s.refresh);
   const loading = useChatStore((s) => s.loading);
   const showThinking = useChatStore((s) => s.showThinking);
@@ -67,6 +69,28 @@ export function ChatToolbar() {
         </TooltipTrigger>
         <TooltipContent>
           <p>{t('toolbar.newSession')}</p>
+        </TooltipContent>
+      </Tooltip>
+
+      {/* Clear History */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 text-muted-foreground hover:text-destructive"
+            disabled={messages.length === 0}
+            onClick={() => {
+              if (confirm(t('toolbar.clearHistoryConfirm'))) {
+                clearHistory();
+              }
+            }}
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>
+          <p>{t('toolbar.clearHistory')}</p>
         </TooltipContent>
       </Tooltip>
 
