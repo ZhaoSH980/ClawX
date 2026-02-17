@@ -25,22 +25,25 @@ export interface AppSettings {
   language: string;
   startMinimized: boolean;
   launchAtStartup: boolean;
-  
+
   // Gateway
   gatewayAutoStart: boolean;
   gatewayPort: number;
   gatewayToken: string;
-  
+
   // Update
   updateChannel: 'stable' | 'beta' | 'dev';
   autoCheckUpdate: boolean;
   autoDownloadUpdate: boolean;
   skippedVersions: string[];
-  
+
   // UI State
   sidebarCollapsed: boolean;
   devModeUnlocked: boolean;
-  
+
+  // Code Mode
+  codeSessionId: string;
+
   // Presets
   selectedBundles: string[];
   enabledSkills: string[];
@@ -71,7 +74,10 @@ const defaults: AppSettings = {
   // UI State
   sidebarCollapsed: false,
   devModeUnlocked: false,
-  
+
+  // Code Mode
+  codeSessionId: '',
+
   // Presets
   selectedBundles: ['productivity', 'developer'],
   enabledSkills: [],

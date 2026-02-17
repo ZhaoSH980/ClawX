@@ -1,0 +1,40 @@
+{
+    "toolbar": {
+        "checking": "Checking Claude Code...",
+        "notInstalled": "Claude Code CLI not installed",
+        "selectDir": "Select working directory",
+        "clear": "Clear messages",
+        "clearConfirm": "Are you sure you want to clear all Code Mode messages? This cannot be undone.",
+        "tgConnect": "Connect Telegram group",
+        "tgDisconnect": "Disconnect Telegram bridge (click to disconnect)",
+        "tgTitle": "Telegram Bridge",
+        "tgDescription": "Connect a dedicated Code Mode bot to a Telegram group. Use /code for direct execution or plain messages for MiniMax orchestration.",
+        "tgBotTokenPlaceholder": "Code Mode Bot Token",
+        "tgBotTokenHint": "Create a second bot via @BotFather for Code Mode. This avoids conflicts with the Gateway bot.",
+        "tgChatIdPlaceholder": "Group/Chat ID, e.g. -1001234567890",
+        "tgHint": "Group IDs usually start with -100. Use @userinfobot or @RawDataBot to find it.",
+        "tgConnectBtn": "Connect",
+        "resetSession": "New session (clear Claude Code context)",
+        "resetSessionConfirm": "Start a new Claude Code session? This clears conversation context so Claude will no longer remember previous commands.",
+        "noSession": "No active session"
+    },
+    "terminal": {
+        "title": "Terminal Output",
+        "empty": "No output yet. Output will appear here after running a command."
+    },
+    "welcome": {
+        "title": "Claude Code Mode",
+        "subtitle": "Control the Claude Code CLI with natural language. Select a working directory to start writing, debugging, and refactoring code."
+    },
+    "cliNotInstalled": {
+        "title": "Claude Code CLI Not Installed",
+        "description": "Please install Claude Code CLI first. Run in terminal: npm install -g @anthropic-ai/claude-code"
+    },
+    "input": {
+        "placeholder": "Enter a command, e.g. \"Refactor the fetchData function in src/utils.ts\"",
+        "notInstalled": "Please install Claude Code CLI first",
+        "selectDirFirst": "Please select a working directory first...",
+        "hint": "Enter to send · Shift+Enter for new line · Click stop button to abort during execution"
+    },
+    "dismiss": "Dismiss"
+}

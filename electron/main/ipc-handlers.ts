@@ -4,6 +4,11 @@
  */
 import { ipcMain, BrowserWindow, shell, dialog, app } from 'electron';
 import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { TelegramCodeBridge } from '../utils/telegram-code-bridge';
+import { MinimaxOrchestrator } from '../utils/minimax-orchestrator';
 import { GatewayManager } from '../gateway/manager';
 import { ClawHubService, ClawHubSearchParams, ClawHubInstallParams, ClawHubUninstallParams } from '../gateway/clawhub';
 import {
@@ -21,7 +26,7 @@ import {
 } from '../utils/secure-storage';
 import { getOpenClawStatus, getOpenClawDir, getOpenClawConfigDir, getOpenClawSkillsDir, ensureDir } from '../utils/paths';
 import { getOpenClawCliCommand, installOpenClawCliMac } from '../utils/openclaw-cli';
-import { getSetting } from '../utils/store';
+import { getSetting, setSetting } from '../utils/store';
 import {
   saveProviderKeyToOpenClaw,
   removeProviderKeyFromOpenClaw,
@@ -90,6 +95,9 @@ export function registerIpcHandlers(
 
   // WhatsApp handlers
   registerWhatsAppHandlers(mainWindow);
+
+  // Code Mode handlers (Claude Code CLI integration)
+  registerCodeModeHandlers(mainWindow, gatewayManager);
 }
 
 /**
@@ -1362,4 +1370,557 @@ function registerWindowHandlers(mainWindow: BrowserWindow): void {
   ipcMain.handle('window:isMaximized', () => {
     return mainWindow.isMaximized();
   });
+}
+
+// ==================== Code Mode Handlers ====================
+
+/**
+ * Resolve the Claude Code CLI executable path.
+ * Checks common installation locations since ~/.local/bin may not be
+ * in the PATH inherited by the Electron process.
+ */
+function resolveClaudeCli(): { cmd: string; shell: boolean } {
+  const isWin = process.platform === 'win32';
+  const home = homedir();
+
+  // Candidate paths where Claude Code CLI could be installed
+  const candidates: string[] = isWin
+    ? [
+        join(home, '.local', 'bin', 'claude.exe'),
+        join(home, 'AppData', 'Roaming', 'npm', 'claude.cmd'),
+        join(home, 'AppData', 'Roaming', 'npm', 'claude'),
+      ]
+    : [
+        join(home, '.local', 'bin', 'claude'),
+        '/usr/local/bin/claude',
+        join(home, '.npm-global', 'bin', 'claude'),
+      ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return { cmd: candidate, shell: false };
+    }
+  }
+
+  // Fallback: hope it's in PATH; use shell so the OS can resolve it
+  return { cmd: 'claude', shell: true };
+}
+
+/**
+ * Build an env object that ensures ~/.local/bin is in PATH.
+ * Electron may not inherit user-level PATH entries.
+ */
+function getClaudeEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  const home = homedir();
+  const localBin = join(home, '.local', 'bin');
+  const sep = process.platform === 'win32' ? ';' : ':';
+
+  if (env.PATH && !env.PATH.includes(localBin)) {
+    env.PATH = `${localBin}${sep}${env.PATH}`;
+  }
+  return env;
+}
+
+/**
+ * Code Mode IPC handlers
+ * Manages Claude Code CLI processes: spawn, stream output, abort.
+ * Integrates with Telegram Code Bridge for mirroring conversations to a TG group.
+ * Supports dual-mode Telegram interaction:
+ *   - /code prefix → direct Claude Code CLI execution
+ *   - plain messages → MiniMax M2.5 orchestration → Claude Code CLI
+ */
+function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: GatewayManager): void {
+  let activeProcess: ChildProcess | null = null;
+  let telegramBridge: TelegramCodeBridge | null = null;
+  let orchestrator: MinimaxOrchestrator | null = null;
+  // Track the Telegram message ID of the last user command for reply threading
+  let lastTgCommandMsgId: number | null = null;
+  // Mutable working directory reference so Telegram-initiated commands use the latest value
+  let currentWorkingDirectory = '';
+  // Session ID for Claude Code conversation continuity (persisted across app restarts via electron-store)
+  let claudeSessionId: string | null = null;
+
+  // Restore persisted session ID on startup
+  getSetting('codeSessionId').then((id) => {
+    if (id) {
+      claudeSessionId = id;
+      console.log('[CodeMode] Restored session:', id);
+    }
+  }).catch(() => { /* ignore */ });
+
+  /**
+   * Core execution logic: spawn Claude Code CLI, stream output, notify Telegram.
+   * Shared by both UI-initiated and Telegram-initiated executions.
+   *
+   * When `options.collectOutput` is true the returned promise resolves with the
+   * extracted summary text after the process exits (used by the orchestrator loop).
+   */
+  async function executeCore(
+    prompt: string,
+    options?: {
+      cwd?: string;
+      maxTurns?: number;
+      fromTelegram?: boolean;
+      /** If true, suppress automatic Telegram response and resolve with summary */
+      collectOutput?: boolean;
+    },
+  ): Promise<{ success: boolean; pid?: number; error?: string; summary?: string }> {
+    if (activeProcess) {
+      return { success: false, error: 'A Claude Code process is already running' };
+    }
+
+    const cwd = options?.cwd || process.cwd();
+    const maxTurns = options?.maxTurns ?? 50;
+
+    if (!existsSync(cwd)) {
+      return { success: false, error: `Working directory does not exist: ${cwd}` };
+    }
+
+    // Send user command to Telegram (unless the command came FROM Telegram or orchestrator handles it)
+    if (telegramBridge?.isEnabled && !options?.fromTelegram && !options?.collectOutput) {
+      const msgId = await telegramBridge.sendUserCommand(prompt);
+      lastTgCommandMsgId = msgId;
+    }
+
+    try {
+      const claude = resolveClaudeCli();
+      const args = [
+        '-p', prompt,
+        '--output-format', 'stream-json',
+        '--max-turns', String(maxTurns),
+        '--verbose',
+        // Non-interactive: skip "allow execution?" prompts so commands run without manual approval
+        '--dangerously-skip-permissions',
+      ];
+
+      // Use --continue to maintain conversation context across commands
+      if (claudeSessionId) {
+        args.push('--resume', claudeSessionId);
+      }
+
+      activeProcess = spawn(claude.cmd, args, {
+        cwd,
+        shell: claude.shell,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: getClaudeEnv(),
+      });
+
+      const pid = activeProcess.pid;
+      let fullOutput = '';
+
+      // When collectOutput is true, we resolve a promise on process exit
+      const collectOutput = options?.collectOutput ?? false;
+
+      return new Promise((resolve) => {
+        // Immediately report success + pid
+        if (!collectOutput) {
+          resolve({ success: true, pid });
+        }
+
+        activeProcess!.stdout?.on('data', (data: Buffer) => {
+          const text = data.toString();
+          fullOutput += text;
+
+          // Capture session_id from the init message for conversation continuity
+          if (!claudeSessionId) {
+            for (const line of text.split('\n')) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              try {
+                const parsed = JSON.parse(trimmed);
+                if (parsed.session_id) {
+                  claudeSessionId = parsed.session_id;
+                  // Persist to electron-store so it survives app restarts
+                  setSetting('codeSessionId', claudeSessionId).catch(() => {});
+                  // Notify renderer for UI display
+                  try { mainWindow.webContents.send('code:session-id', claudeSessionId); } catch { /* */ }
+                  break;
+                }
+              } catch { /* not JSON */ }
+            }
+          }
+
+          try {
+            mainWindow.webContents.send('code:output', { type: 'stdout', data: text, pid });
+          } catch { /* window closed */ }
+        });
+
+        activeProcess!.stderr?.on('data', (data: Buffer) => {
+          const text = data.toString();
+          try {
+            mainWindow.webContents.send('code:output', { type: 'stderr', data: text, pid });
+          } catch { /* window closed */ }
+        });
+
+        activeProcess!.on('close', (code, signal) => {
+          try {
+            mainWindow.webContents.send('code:output', {
+              type: 'exit',
+              code,
+              signal,
+              pid,
+            });
+          } catch { /* window closed */ }
+
+          const summary = extractSummary(fullOutput, code);
+
+          // Send to Telegram unless orchestrator handles it
+          if (telegramBridge?.isEnabled && !collectOutput) {
+            telegramBridge.sendAssistantResponse(summary, lastTgCommandMsgId).catch(() => {});
+            lastTgCommandMsgId = null;
+          }
+
+          activeProcess = null;
+
+          if (collectOutput) {
+            resolve({ success: true, pid, summary });
+          }
+        });
+
+        activeProcess!.on('error', (err) => {
+          try {
+            mainWindow.webContents.send('code:output', {
+              type: 'error',
+              data: err.message,
+              pid,
+            });
+          } catch { /* window closed */ }
+
+          if (telegramBridge?.isEnabled && !collectOutput) {
+            telegramBridge.sendStatus(`Error: ${err.message}`).catch(() => {});
+            lastTgCommandMsgId = null;
+          }
+
+          activeProcess = null;
+
+          if (collectOutput) {
+            resolve({ success: false, error: err.message });
+          }
+        });
+      });
+    } catch (error) {
+      activeProcess = null;
+      return { success: false, error: String(error) };
+    }
+  }
+
+  /**
+   * Abort any running Claude Code process.
+   * Returns the PID of the killed process (or null).
+   */
+  function abortActiveProcess(): number | null {
+    if (!activeProcess) return null;
+    const pid = activeProcess.pid ?? null;
+    try {
+      if (process.platform === 'win32' && pid) {
+        spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { shell: true });
+      } else if (activeProcess.kill) {
+        activeProcess.kill('SIGTERM');
+      }
+    } catch { /* already dead */ }
+    activeProcess = null;
+    return pid;
+  }
+
+  /**
+   * Handle a plain Telegram message via MiniMax orchestration.
+   * MiniMax analyses the user's intent, optionally generates Claude Code commands,
+   * and loops until no more commands are produced.
+   */
+  async function handleOrchestratedChat(userMessage: string): Promise<void> {
+    if (!orchestrator || !telegramBridge?.isEnabled) return;
+
+    // Abort any running process before starting orchestration
+    if (activeProcess) {
+      abortActiveProcess();
+      await telegramBridge.sendStatus('⏹ 已中止上一任务，开始处理新消息…');
+    }
+
+    // Forward to UI
+    try {
+      mainWindow.webContents.send('code:telegram-command', `[MiniMax] ${userMessage}`);
+    } catch { /* window closed */ }
+
+    // Orchestration loop: MiniMax may issue multiple sequential commands
+    const MAX_ROUNDS = 5;
+    let round = 0;
+    let pendingMessage = userMessage;
+
+    while (round < MAX_ROUNDS) {
+      round++;
+
+      const result = await orchestrator.chat(pendingMessage);
+
+      // Send MiniMax's reply to Telegram
+      await telegramBridge.sendOrchestratorMessage(result.reply);
+
+      if (!result.command) {
+        // No command to execute — done
+        break;
+      }
+
+      // Send the command MiniMax wants to execute
+      const cmdMsgId = await telegramBridge.sendUserCommand(result.command);
+      await telegramBridge.sendStatus('⏳ 执行中，请稍候…');
+
+      // Forward command to UI
+      try {
+        mainWindow.webContents.send('code:telegram-command', `[MiniMax→Code] ${result.command}`);
+      } catch { /* window closed */ }
+
+      // Execute Claude Code and wait for result
+      const execResult = await executeCore(result.command, {
+        cwd: currentWorkingDirectory || undefined,
+        fromTelegram: true,
+        collectOutput: true,
+      });
+
+      const summary = execResult.summary || execResult.error || 'No output';
+
+      // Send Claude Code result to Telegram
+      await telegramBridge.sendAssistantResponse(summary, cmdMsgId);
+
+      // Feed result back to MiniMax for potential follow-up
+      orchestrator.addCodeResult(summary);
+
+      // The next loop iteration will call orchestrator.chat() with the code result
+      // to see if MiniMax wants to do more
+      pendingMessage = `[Claude Code 执行结果]\n${summary}`;
+    }
+
+    if (round >= MAX_ROUNDS) {
+      await telegramBridge.sendStatus('⚠️ 已达到最大编排轮次限制，停止执行。');
+    }
+  }
+
+  // Check if Claude Code CLI is installed
+  ipcMain.handle('code:status', async () => {
+    try {
+      const claude = resolveClaudeCli();
+      const result = await new Promise<{ installed: boolean; version?: string }>((resolve) => {
+        const proc = spawn(claude.cmd, ['--version'], {
+          shell: claude.shell,
+          timeout: 10000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: getClaudeEnv(),
+        });
+        let stdout = '';
+        proc.stdout?.on('data', (d: Buffer) => { stdout += d.toString(); });
+        proc.on('error', () => resolve({ installed: false }));
+        proc.on('close', (exitCode) => {
+          if (exitCode === 0 && stdout.trim()) {
+            resolve({ installed: true, version: stdout.trim() });
+          } else {
+            resolve({ installed: false });
+          }
+        });
+      });
+      return result;
+    } catch {
+      return { installed: false };
+    }
+  });
+
+  // Execute a prompt via Claude Code CLI with streaming output
+  ipcMain.handle(
+    'code:execute',
+    async (_, prompt: string, options?: { cwd?: string; maxTurns?: number }) => {
+      // Keep the mutable cwd reference in sync with the latest UI value
+      if (options?.cwd) {
+        currentWorkingDirectory = options.cwd;
+      }
+      return executeCore(prompt, options);
+    },
+  );
+
+  // Abort the running Claude Code process
+  ipcMain.handle('code:abort', () => {
+    const pid = abortActiveProcess();
+    if (pid !== null) {
+      if (telegramBridge?.isEnabled) {
+        telegramBridge.sendStatus('⏹ Execution aborted').catch(() => {});
+      }
+      return { success: true, pid };
+    }
+    return { success: false, error: 'No active process' };
+  });
+
+  // Open directory picker dialog
+  ipcMain.handle('code:selectDirectory', async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openDirectory'],
+      title: 'Select Working Directory',
+    });
+    if (result.canceled || result.filePaths.length === 0) {
+      return { canceled: true };
+    }
+    return { canceled: false, path: result.filePaths[0] };
+  });
+
+  // ── Telegram Bridge ─────────────────────────────────────────
+
+  // Enable Telegram bridge with a dedicated bot token and chat/group ID
+  ipcMain.handle(
+    'code:enableTelegram',
+    async (_, botToken: string, chatId: string, options?: { cwd?: string }) => {
+      // Clean up existing bridge and orchestrator
+      if (telegramBridge) {
+        telegramBridge.destroy();
+        telegramBridge = null;
+      }
+      if (orchestrator) {
+        orchestrator.clearHistory();
+        orchestrator = null;
+      }
+
+      telegramBridge = new TelegramCodeBridge();
+      const initResult = await telegramBridge.init(botToken, chatId);
+
+      if (!initResult.success) {
+        telegramBridge = null;
+        return initResult;
+      }
+
+      // Guard: another call (e.g. disable or re-connect) may have cleared the bridge
+      if (!telegramBridge) {
+        return { success: false, error: 'Connection was cancelled or superseded' };
+      }
+
+      // Track initial cwd
+      if (options?.cwd) {
+        currentWorkingDirectory = options.cwd;
+      }
+
+      // Initialise MiniMax orchestrator (best-effort: if key not configured, chat mode is disabled)
+      orchestrator = new MinimaxOrchestrator();
+      const orchInit = await orchestrator.init();
+      if (!orchInit.success) {
+        console.warn('[CodeMode] MiniMax orchestrator not available:', orchInit.error);
+        // Keep orchestrator null so plain messages are ignored
+        orchestrator = null;
+      }
+
+      // Start polling with dual callbacks
+      await telegramBridge.startPolling({
+        // /code prefix → direct Claude Code execution
+        onCommand: async (command: string) => {
+          if (activeProcess) {
+            abortActiveProcess();
+            await telegramBridge?.sendStatus('⏹ 已中止上一任务，开始执行新指令…');
+          }
+
+          const tgMsgId = await telegramBridge!.sendUserCommand(command);
+          lastTgCommandMsgId = tgMsgId;
+
+          await telegramBridge!.sendStatus('⏳ 执行中，请稍候…');
+
+          try {
+            mainWindow.webContents.send('code:telegram-command', command);
+          } catch { /* window closed */ }
+
+          await executeCore(command, { cwd: currentWorkingDirectory || undefined, fromTelegram: true });
+        },
+
+        // Plain messages → MiniMax M2.5 orchestration
+        onChat: orchestrator
+          ? (text: string) => { handleOrchestratedChat(text).catch((err) => console.error('[CodeMode] orchestration error:', err)); }
+          : undefined,
+      });
+
+      // Build connection status message
+      let statusMsg = `🟢 Code Mode bridge connected\nWorking directory: ${currentWorkingDirectory || '(default)'}`;
+      statusMsg += '\n\n📡 Using dedicated Code Mode bot. Gateway Telegram unaffected.';
+      if (orchestrator) {
+        statusMsg += '\n\n✅ MiniMax M2.5 编排已启用\n• /code <指令> → 直接执行 Claude Code\n• 直接发消息 → MiniMax 分析后自动执行';
+      } else {
+        statusMsg += '\n\n⚠️ MiniMax 未配置，仅支持 /code 命令模式\n请到 设置→Providers 添加 MiniMax API key 以启用智能编排。';
+      }
+
+      if (telegramBridge) {
+        await telegramBridge.sendStatus(statusMsg);
+      }
+      return initResult;
+    },
+  );
+
+  // Disable Telegram bridge
+  ipcMain.handle('code:disableTelegram', async () => {
+    if (telegramBridge) {
+      await telegramBridge.sendStatus('🔴 Code Mode bridge disconnected');
+      telegramBridge.destroy();
+      telegramBridge = null;
+    }
+    if (orchestrator) {
+      orchestrator.clearHistory();
+      orchestrator = null;
+    }
+
+    return { success: true };
+  });
+
+  // Get Telegram bridge status
+  ipcMain.handle('code:telegramStatus', () => {
+    return { enabled: telegramBridge?.isEnabled ?? false };
+  });
+
+  // Get current Claude Code session ID
+  ipcMain.handle('code:getSessionId', () => {
+    return { sessionId: claudeSessionId || null };
+  });
+
+  // Reset Claude Code session (start fresh conversation)
+  ipcMain.handle('code:resetSession', async () => {
+    claudeSessionId = null;
+    await setSetting('codeSessionId', '').catch(() => {});
+    // Also clear orchestrator history since context is no longer valid
+    if (orchestrator) {
+      orchestrator.clearHistory();
+    }
+    return { success: true };
+  });
+}
+
+/**
+ * Extract a readable summary from Claude Code CLI stream-json output.
+ */
+function extractSummary(fullOutput: string, exitCode: number | null): string {
+  const lines = fullOutput.split('\n');
+  const resultParts: string[] = [];
+  const assistantParts: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      // 'result' is the final summary from Claude Code — prefer this over 'assistant'
+      if (parsed.type === 'result' && parsed.result) {
+        resultParts.push(parsed.result);
+      } else if (parsed.type === 'assistant' && parsed.message?.content) {
+        const content = parsed.message.content;
+        if (typeof content === 'string') {
+          assistantParts.push(content);
+        } else if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === 'text' && block.text) {
+              assistantParts.push(block.text);
+            }
+          }
+        }
+      }
+    } catch {
+      // Not JSON, skip
+    }
+  }
+
+  // Prefer 'result' entries (final summary); fall back to 'assistant' messages
+  const summary = (resultParts.length > 0 ? resultParts : assistantParts).join('\n').trim();
+  if (summary) return summary;
+
+  // Fallback
+  if (fullOutput.length > 500) {
+    return `…${fullOutput.slice(-500)}`;
+  }
+  return fullOutput || (exitCode === 0 ? 'Done.' : `Process exited with code ${exitCode}`);
 }

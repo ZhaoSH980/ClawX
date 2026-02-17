@@ -16,8 +16,10 @@ import { Skills } from './pages/Skills';
 import { Cron } from './pages/Cron';
 import { Settings } from './pages/Settings';
 import { Setup } from './pages/Setup';
+import { CodeMode } from './pages/CodeMode';
 import { useSettingsStore } from './stores/settings';
 import { useGatewayStore } from './stores/gateway';
+import { useCodeStore } from './stores/code';
 
 
 /**
@@ -91,6 +93,7 @@ function App() {
   const language = useSettingsStore((state) => state.language);
   const setupComplete = useSettingsStore((state) => state.setupComplete);
   const initGateway = useGatewayStore((state) => state.init);
+  const checkTelegramStatus = useCodeStore((s) => s.checkTelegramStatus);
 
   // Sync i18n language with persisted settings on mount
   useEffect(() => {
@@ -103,6 +106,11 @@ function App() {
   useEffect(() => {
     initGateway();
   }, [initGateway]);
+
+  // Auto-connect Code Mode Telegram bridge on app startup (if previously configured)
+  useEffect(() => {
+    checkTelegramStatus();
+  }, [checkTelegramStatus]);
 
   // Redirect to setup wizard if not complete
   useEffect(() => {
@@ -154,6 +162,7 @@ function App() {
           {/* Main application routes */}
           <Route element={<MainLayout />}>
             <Route path="/" element={<Chat />} />
+            <Route path="/code" element={<CodeMode />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/channels" element={<Channels />} />
             <Route path="/skills" element={<Skills />} />

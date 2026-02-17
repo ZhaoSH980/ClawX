@@ -1,0 +1,35 @@
+{
+    "toolbar": {
+        "checking": "Claude Code を確認中...",
+        "notInstalled": "Claude Code CLI がインストールされていません",
+        "selectDir": "作業ディレクトリを選択",
+        "clear": "メッセージをクリア",
+        "clearConfirm": "コードモードのすべてのメッセージをクリアしますか？この操作は元に戻せません。",
+        "tgConnect": "Telegram グループに接続",
+        "tgDisconnect": "Telegram ブリッジを切断（クリックで切断）",
+        "tgTitle": "Telegram ブリッジ",
+        "tgDescription": "コードモードの会話を Telegram グループにミラーリングします。コマンドと Claude の応答がそれぞれ送信されます。グループ内で /code コマンドも使用できます。",
+        "tgChatIdPlaceholder": "グループ/チャット ID、例: -1001234567890",
+        "tgHint": "グループ ID は通常 -100 で始まります。@userinfobot や @RawDataBot で確認できます。",
+        "tgConnectBtn": "接続"
+    },
+    "terminal": {
+        "title": "ターミナル出力",
+        "empty": "まだ出力がありません。コマンド実行後にここに表示されます。"
+    },
+    "welcome": {
+        "title": "Claude Code モード",
+        "subtitle": "自然言語で Claude Code CLI を操作します。作業ディレクトリを選択して、コードの作成・デバッグ・リファクタリングを開始しましょう。"
+    },
+    "cliNotInstalled": {
+        "title": "Claude Code CLI がインストールされていません",
+        "description": "まず Claude Code CLI をインストールしてください。ターミナルで実行: npm install -g @anthropic-ai/claude-code"
+    },
+    "input": {
+        "placeholder": "コマンドを入力してください。例：「src/utils.ts の fetchData 関数をリファクタリングして」",
+        "notInstalled": "まず Claude Code CLI をインストールしてください",
+        "selectDirFirst": "まず作業ディレクトリを選択してください...",
+        "hint": "Enter で送信 · Shift+Enter で改行 · 実行中は停止ボタンで中断可能"
+    },
+    "dismiss": "閉じる"
+}

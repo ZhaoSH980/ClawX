@@ -6,6 +6,7 @@
         "channels": "Channels",
         "dashboard": "Dashboard",
         "settings": "Settings",
+        "codeMode": "Code Mode",
         "devConsole": "Developer Console"
     },
     "actions": {

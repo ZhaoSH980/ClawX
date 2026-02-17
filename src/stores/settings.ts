@@ -32,6 +32,12 @@ interface SettingsState {
   // Setup
   setupComplete: boolean;
 
+  // Code Mode
+  codeWorkingDirectory: string;
+  codeTelegramBotToken: string;
+  codeTelegramChatId: string;
+  codeSessionId: string;
+
   // Actions
   setTheme: (theme: Theme) => void;
   setLanguage: (language: string) => void;
@@ -44,6 +50,10 @@ interface SettingsState {
   setAutoDownloadUpdate: (value: boolean) => void;
   setSidebarCollapsed: (value: boolean) => void;
   setDevModeUnlocked: (value: boolean) => void;
+  setCodeWorkingDirectory: (dir: string) => void;
+  setCodeTelegramBotToken: (token: string) => void;
+  setCodeTelegramChatId: (chatId: string) => void;
+  setCodeSessionId: (sessionId: string) => void;
   markSetupComplete: () => void;
   resetSettings: () => void;
 }
@@ -66,6 +76,10 @@ const defaultSettings = {
   sidebarCollapsed: false,
   devModeUnlocked: false,
   setupComplete: false,
+  codeWorkingDirectory: '',
+  codeTelegramBotToken: '',
+  codeTelegramChatId: '',
+  codeSessionId: '',
 };
 
 export const useSettingsStore = create<SettingsState>()(
@@ -84,6 +98,10 @@ export const useSettingsStore = create<SettingsState>()(
       setAutoDownloadUpdate: (autoDownloadUpdate) => set({ autoDownloadUpdate }),
       setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
       setDevModeUnlocked: (devModeUnlocked) => set({ devModeUnlocked }),
+      setCodeWorkingDirectory: (codeWorkingDirectory) => set({ codeWorkingDirectory }),
+      setCodeTelegramBotToken: (codeTelegramBotToken) => set({ codeTelegramBotToken }),
+      setCodeTelegramChatId: (codeTelegramChatId) => set({ codeTelegramChatId }),
+      setCodeSessionId: (codeSessionId) => set({ codeSessionId }),
       markSetupComplete: () => set({ setupComplete: true }),
       resetSettings: () => set(defaultSettings),
     }),

@@ -121,6 +121,16 @@ const electronAPI = {
         'openclaw:getSkillsDir',
         'openclaw:getCliCommand',
         'openclaw:installCliMac',
+        // Code Mode (Claude Code CLI)
+        'code:status',
+        'code:execute',
+        'code:abort',
+        'code:selectDirectory',
+        'code:enableTelegram',
+        'code:disableTelegram',
+        'code:telegramStatus',
+        'code:getSessionId',
+        'code:resetSession',
       ];
 
       if (validChannels.includes(channel)) {
@@ -154,6 +164,10 @@ const electronAPI = {
         'update:downloaded',
         'update:error',
         'cron:updated',
+        // Code Mode streaming output + Telegram commands
+        'code:output',
+        'code:telegram-command',
+        'code:session-id',
       ];
 
       if (validChannels.includes(channel)) {

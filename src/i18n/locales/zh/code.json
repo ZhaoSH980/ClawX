@@ -1,0 +1,40 @@
+{
+    "toolbar": {
+        "checking": "检测 Claude Code...",
+        "notInstalled": "Claude Code CLI 未安装",
+        "selectDir": "选择工作目录",
+        "clear": "清除消息",
+        "clearConfirm": "确定要清除所有代码模式消息吗？此操作不可撤销。",
+        "tgConnect": "连接 Telegram 群组",
+        "tgDisconnect": "断开 Telegram 桥接（点击断开）",
+        "tgTitle": "Telegram 桥接",
+        "tgDescription": "连接专用 Code Mode Bot 到 Telegram 群组。使用 /code 直接执行指令，或发送普通消息由 MiniMax 编排执行。",
+        "tgBotTokenPlaceholder": "Code Mode 专用 Bot Token",
+        "tgBotTokenHint": "请通过 @BotFather 创建第二个 Bot 用于 Code Mode，避免与 Gateway Bot 冲突。",
+        "tgChatIdPlaceholder": "群组/聊天 ID，例如 -1001234567890",
+        "tgHint": "群组 ID 通常以 -100 开头。可以通过 @userinfobot 或 @RawDataBot 获取。",
+        "tgConnectBtn": "连接",
+        "resetSession": "新建会话（清除 Claude Code 上下文）",
+        "resetSessionConfirm": "开始新的 Claude Code 会话？这将清除对话上下文，Claude 将不再记得之前的指令。",
+        "noSession": "无活跃会话"
+    },
+    "terminal": {
+        "title": "终端输出",
+        "empty": "尚无输出。发送指令后输出将显示在此处。"
+    },
+    "welcome": {
+        "title": "Claude Code 模式",
+        "subtitle": "通过自然语言指令控制 Claude Code CLI。选择工作目录后即可开始编写、调试和重构代码。"
+    },
+    "cliNotInstalled": {
+        "title": "Claude Code CLI 未安装",
+        "description": "请先安装 Claude Code CLI。在终端中运行: npm install -g @anthropic-ai/claude-code"
+    },
+    "input": {
+        "placeholder": "输入指令，例如：「帮我重构 src/utils.ts 中的 fetchData 函数」",
+        "notInstalled": "请先安装 Claude Code CLI",
+        "selectDirFirst": "请先选择工作目录...",
+        "hint": "Enter 发送 · Shift+Enter 换行 · 运行期间可点击停止按钮中止"
+    },
+    "dismiss": "关闭"
+}
