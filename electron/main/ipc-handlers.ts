@@ -1512,6 +1512,11 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
       // When collectOutput is true, we resolve a promise on process exit
       const collectOutput = options?.collectOutput ?? false;
 
+      // Stream progress tracker for Telegram
+      const progressTracker = telegramBridge?.isEnabled
+        ? new StreamProgressTracker(telegramBridge)
+        : null;
+
       return new Promise((resolve) => {
         // Immediately report success + pid
         if (!collectOutput) {
@@ -1522,23 +1527,25 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
           const text = data.toString();
           fullOutput += text;
 
-          // Capture session_id from the init message for conversation continuity
-          if (!claudeSessionId) {
-            for (const line of text.split('\n')) {
-              const trimmed = line.trim();
-              if (!trimmed) continue;
-              try {
-                const parsed = JSON.parse(trimmed);
-                if (parsed.session_id) {
-                  claudeSessionId = parsed.session_id;
-                  // Persist to electron-store so it survives app restarts
-                  setSetting('codeSessionId', claudeSessionId).catch(() => {});
-                  // Notify renderer for UI display
-                  try { mainWindow.webContents.send('code:session-id', claudeSessionId); } catch { /* */ }
-                  break;
-                }
-              } catch { /* not JSON */ }
-            }
+          // Parse each JSON line for session_id capture and progress tracking
+          for (const line of text.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const parsed = JSON.parse(trimmed);
+
+              // Capture session_id from the init message for conversation continuity
+              if (!claudeSessionId && parsed.session_id) {
+                claudeSessionId = parsed.session_id;
+                setSetting('codeSessionId', claudeSessionId).catch(() => {});
+                try { mainWindow.webContents.send('code:session-id', claudeSessionId); } catch { /* */ }
+              }
+
+              // Feed to progress tracker
+              if (progressTracker) {
+                progressTracker.onStreamEvent(parsed);
+              }
+            } catch { /* not JSON */ }
           }
 
           try {
@@ -1553,7 +1560,7 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
           } catch { /* window closed */ }
         });
 
-        activeProcess!.on('close', (code, signal) => {
+        activeProcess!.on('close', async (code, signal) => {
           try {
             mainWindow.webContents.send('code:output', {
               type: 'exit',
@@ -1562,6 +1569,11 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
               pid,
             });
           } catch { /* window closed */ }
+
+          // Clean up progress message before sending final result
+          if (progressTracker) {
+            await progressTracker.finish();
+          }
 
           const summary = extractSummary(fullOutput, code);
 
@@ -1578,7 +1590,7 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
           }
         });
 
-        activeProcess!.on('error', (err) => {
+        activeProcess!.on('error', async (err) => {
           try {
             mainWindow.webContents.send('code:output', {
               type: 'error',
@@ -1586,6 +1598,11 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
               pid,
             });
           } catch { /* window closed */ }
+
+          // Clean up progress message on error
+          if (progressTracker) {
+            await progressTracker.finish();
+          }
 
           if (telegramBridge?.isEnabled && !collectOutput) {
             telegramBridge.sendStatus(`Error: ${err.message}`).catch(() => {});
@@ -1879,6 +1896,188 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
     }
     return { success: true };
   });
+}
+
+/**
+ * Tracks Claude Code stream-json events and pushes live progress updates
+ * to Telegram via the bridge's updateProgress/finishProgress API.
+ *
+ * Progress is displayed as a compact status panel that is edited in-place:
+ *
+ *   ⚙️ Claude Code 执行中…
+ *
+ *   🔄 Turn 2
+ *   💭 正在分析代码结构…
+ *   🔧 Read(src/utils.ts)
+ *   ✅ Read 完成
+ *   🔧 Edit(src/utils.ts)
+ */
+class StreamProgressTracker {
+  private bridge: TelegramCodeBridge;
+  /** Recent progress steps (rolling window to keep the message compact) */
+  private steps: string[] = [];
+  /** Current thinking/assistant text snippet */
+  private currentThinking = '';
+  /** Current tool being used */
+  private currentTool = '';
+  /** Conversation turn counter */
+  private turnCount = 0;
+  /** Whether the tracker has been finished (prevents further updates) */
+  private finished = false;
+  /** Timer for deferred flush */
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Maximum number of recent steps to keep visible */
+  private static readonly MAX_VISIBLE_STEPS = 8;
+
+  constructor(bridge: TelegramCodeBridge) {
+    this.bridge = bridge;
+  }
+
+  /**
+   * Process a parsed stream-json event from Claude Code CLI.
+   * Common event types:
+   *   { type: "system", ... }           — init/session info
+   *   { type: "assistant", message: { content: [...] } } — assistant thinking/response
+   *   { type: "tool_use", tool: "...", input: {...} }    — tool invocation
+   *   { type: "tool_result", ... }      — tool result
+   *   { type: "result", ... }           — final result
+   */
+  onStreamEvent(event: Record<string, unknown>): void {
+    if (this.finished) return;
+
+    const eventType = event.type as string | undefined;
+
+    switch (eventType) {
+      case 'assistant': {
+        this.turnCount++;
+        // Extract a short snippet from the assistant's thinking
+        const content = (event.message as Record<string, unknown>)?.content;
+        let snippet = '';
+        if (typeof content === 'string') {
+          snippet = content;
+        } else if (Array.isArray(content)) {
+          for (const block of content) {
+            if ((block as Record<string, unknown>)?.type === 'text') {
+              snippet = (block as Record<string, unknown>).text as string || '';
+              break;
+            }
+          }
+        }
+        if (snippet) {
+          // Take first meaningful line, truncate
+          const firstLine = snippet.split('\n').find((l: string) => l.trim()) || '';
+          this.currentThinking = firstLine.length > 80
+            ? firstLine.slice(0, 77) + '…'
+            : firstLine;
+          this.scheduleFlush();
+        }
+        break;
+      }
+
+      case 'tool_use': {
+        const toolName = (event.tool as string) || 'unknown';
+        // Extract a short description of what the tool is doing
+        const input = event.input as Record<string, unknown> | undefined;
+        let detail = '';
+        if (input) {
+          // Common tool patterns
+          if (input.file_path) detail = ` → ${basename(String(input.file_path))}`;
+          else if (input.path) detail = ` → ${basename(String(input.path))}`;
+          else if (input.command) {
+            const cmd = String(input.command);
+            detail = ` → ${cmd.length > 40 ? cmd.slice(0, 37) + '…' : cmd}`;
+          }
+          else if (input.pattern) detail = ` → ${String(input.pattern)}`;
+        }
+        this.currentTool = `🔧 ${toolName}${detail}`;
+        this.addStep(this.currentTool);
+        this.scheduleFlush();
+        break;
+      }
+
+      case 'tool_result': {
+        if (this.currentTool) {
+          // Mark the tool as completed
+          const toolLabel = this.currentTool.replace('🔧', '✅');
+          // Replace the last matching tool step with the completed version
+          for (let i = this.steps.length - 1; i >= 0; i--) {
+            if (this.steps[i] === this.currentTool) {
+              this.steps[i] = toolLabel;
+              break;
+            }
+          }
+          this.currentTool = '';
+          this.scheduleFlush();
+        }
+        break;
+      }
+
+      // Ignore system, result, and other types
+      default:
+        break;
+    }
+  }
+
+  /**
+   * Finish tracking: clean up the progress message.
+   */
+  async finish(): Promise<void> {
+    this.finished = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await this.bridge.finishProgress();
+  }
+
+  // ── Private ─────────────────────────────────────────────
+
+  private addStep(step: string): void {
+    this.steps.push(step);
+    // Keep only the most recent steps
+    if (this.steps.length > StreamProgressTracker.MAX_VISIBLE_STEPS) {
+      this.steps = this.steps.slice(-StreamProgressTracker.MAX_VISIBLE_STEPS);
+    }
+  }
+
+  /**
+   * Schedule a flush to Telegram. Defers by 300ms so rapid events
+   * are batched into a single edit.
+   */
+  private scheduleFlush(): void {
+    if (this.flushTimer) return; // already scheduled
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flush();
+    }, 300);
+  }
+
+  private flush(): void {
+    if (this.finished) return;
+
+    const lines: string[] = [];
+    if (this.turnCount > 0) {
+      lines.push(`🔄 Turn ${this.turnCount}`);
+    }
+    if (this.currentThinking) {
+      lines.push(`💭 ${this.currentThinking}`);
+    }
+    if (this.steps.length > 0) {
+      lines.push('');
+      lines.push(...this.steps);
+    }
+
+    if (lines.length === 0) return;
+
+    this.bridge.updateProgress(lines).catch(() => {});
+  }
+}
+
+/** Extract the filename from a path (cross-platform). */
+function basename(filePath: string): string {
+  const parts = filePath.replace(/\\/g, '/').split('/');
+  return parts[parts.length - 1] || filePath;
 }
 
 /**

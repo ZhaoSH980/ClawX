@@ -8,6 +8,9 @@
 // Telegram Bot API base URL
 const TG_API = 'https://api.telegram.org/bot';
 
+/** Telegram hard limit per message */
+const TG_MAX_LENGTH = 4096;
+
 interface TelegramMessage {
   message_id: number;
   chat: { id: number };
@@ -39,6 +42,13 @@ export class TelegramCodeBridge {
   private enabled = false;
   private onCommand: ((text: string) => void) | null = null;
   private onChat: ((text: string) => void) | null = null;
+
+  /** Currently active progress message ID (for in-place edits) */
+  private progressMsgId: number | null = null;
+  /** Timestamp of the last editMessage call (for throttling) */
+  private lastProgressEditMs = 0;
+  /** Minimum interval between editMessage calls (Telegram rate limit protection) */
+  private static readonly PROGRESS_THROTTLE_MS = 2000;
 
   /**
    * Initialize the bridge with a dedicated bot token and target chat/group ID.
@@ -125,43 +135,43 @@ export class TelegramCodeBridge {
 
   /**
    * Send Claude's response to Telegram (formatted as a response block).
-   * If replyToId is provided, sends as a reply to the command message.
+   * Long responses are automatically split into multiple messages.
+   * If replyToId is provided, the first chunk is sent as a reply.
    */
   async sendAssistantResponse(text: string, replyToId?: number | null): Promise<number | null> {
     if (!this.enabled || !this.botToken || !this.chatId) return null;
 
-    // Telegram message limit is 4096 chars.
-    // Escape first, then truncate to account for expanded HTML entities.
-    const prefix = '🤖 <b>Claude Code</b>\n<pre>';
-    const suffix = '</pre>';
-    const overhead = prefix.length + suffix.length;
-    const maxBody = 4096 - overhead - 30; // 30 chars safety margin for "… (truncated)"
+    const prefix = '🤖 <b>Claude Code</b>\n';
+    const escaped = escapeHtml(text);
+    const chunks = splitForTelegram(escaped, prefix, '<pre>', '</pre>');
 
-    let escaped = escapeHtml(text);
-    if (escaped.length > maxBody) {
-      escaped = escaped.slice(0, maxBody) + '\n\n… (truncated)';
+    let firstMsgId: number | null = null;
+    for (let i = 0; i < chunks.length; i++) {
+      const replyTo = i === 0 ? (replyToId ?? undefined) : undefined;
+      const msgId = await this.sendMessage(chunks[i], replyTo);
+      if (i === 0) firstMsgId = msgId;
     }
-
-    const formatted = `${prefix}${escaped}${suffix}`;
-    return this.sendMessage(formatted, replyToId ?? undefined);
+    return firstMsgId;
   }
 
   /**
    * Send MiniMax orchestrator message to Telegram.
+   * Long responses are automatically split into multiple messages.
    */
   async sendOrchestratorMessage(text: string, replyToId?: number | null): Promise<number | null> {
     if (!this.enabled || !this.botToken || !this.chatId) return null;
 
     const prefix = '🧠 <b>MiniMax M2.5</b>\n';
-    const maxBody = 4096 - prefix.length - 30;
+    const escaped = escapeHtml(text);
+    const chunks = splitForTelegram(escaped, prefix, '', '');
 
-    let escaped = escapeHtml(text);
-    if (escaped.length > maxBody) {
-      escaped = escaped.slice(0, maxBody) + '\n\n… (truncated)';
+    let firstMsgId: number | null = null;
+    for (let i = 0; i < chunks.length; i++) {
+      const replyTo = i === 0 ? (replyToId ?? undefined) : undefined;
+      const msgId = await this.sendMessage(chunks[i], replyTo);
+      if (i === 0) firstMsgId = msgId;
     }
-
-    const formatted = `${prefix}${escaped}`;
-    return this.sendMessage(formatted, replyToId ?? undefined);
+    return firstMsgId;
   }
 
   /**
@@ -174,6 +184,60 @@ export class TelegramCodeBridge {
     return this.sendMessage(formatted);
   }
 
+  // ── Streaming Progress ─────────────────────────────────────
+
+  /**
+   * Create or update a live progress message in Telegram.
+   * The message is edited in-place to show real-time status,
+   * throttled to avoid hitting Telegram's rate limits (~30 edits/s per chat).
+   *
+   * @param lines  Progress lines to display (each line is a step/action)
+   * @param force  If true, bypass throttle (used for the final update)
+   * @returns The progress message ID
+   */
+  async updateProgress(lines: string[], force = false): Promise<number | null> {
+    if (!this.enabled || !this.botToken || !this.chatId) return null;
+
+    const now = Date.now();
+    if (!force && now - this.lastProgressEditMs < TelegramCodeBridge.PROGRESS_THROTTLE_MS) {
+      return this.progressMsgId;
+    }
+
+    const html = `⚙️ <b>Claude Code 执行中…</b>\n\n${lines.map((l) => escapeHtml(l)).join('\n')}`;
+    // Truncate to Telegram limit (progress messages should be short, but just in case)
+    const truncated = html.length > TG_MAX_LENGTH ? html.slice(0, TG_MAX_LENGTH - 3) + '…' : html;
+
+    if (this.progressMsgId) {
+      // Edit the existing progress message
+      const ok = await this.editMessage(this.progressMsgId, truncated);
+      if (ok) {
+        this.lastProgressEditMs = now;
+        return this.progressMsgId;
+      }
+      // If edit failed (message deleted?), fall through to create a new one
+    }
+
+    // Create a new progress message
+    const msgId = await this.sendMessage(truncated);
+    if (msgId) {
+      this.progressMsgId = msgId;
+      this.lastProgressEditMs = now;
+    }
+    return msgId;
+  }
+
+  /**
+   * Finish progress tracking: delete the progress message so the final
+   * result message stands on its own.
+   */
+  async finishProgress(): Promise<void> {
+    if (this.progressMsgId) {
+      await this.deleteMessage(this.progressMsgId);
+      this.progressMsgId = null;
+      this.lastProgressEditMs = 0;
+    }
+  }
+
   /**
    * Disable and clean up.
    */
@@ -183,6 +247,8 @@ export class TelegramCodeBridge {
     this.botToken = null;
     this.chatId = null;
     this.botUserId = null;
+    this.progressMsgId = null;
+    this.lastProgressEditMs = 0;
   }
 
   get isEnabled() {
@@ -218,6 +284,64 @@ export class TelegramCodeBridge {
     } catch (err) {
       console.warn('[TelegramCodeBridge] sendMessage error:', err);
       return null;
+    }
+  }
+
+  /**
+   * Edit an existing message (used for in-place progress updates).
+   */
+  private async editMessage(messageId: number, html: string): Promise<boolean> {
+    if (!this.botToken || !this.chatId) return false;
+
+    try {
+      const res = await fetch(`${TG_API}${this.botToken}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: this.chatId,
+          message_id: messageId,
+          text: html,
+          parse_mode: 'HTML',
+        }),
+      });
+      const data = (await res.json()) as TelegramSendResult;
+      if (!data.ok) {
+        // "message is not modified" is fine — content didn't change
+        if (data.description?.includes('not modified')) return true;
+        console.warn('[TelegramCodeBridge] editMessage failed:', data.description);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.warn('[TelegramCodeBridge] editMessage error:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Delete a message (used to clean up progress messages after completion).
+   */
+  private async deleteMessage(messageId: number): Promise<boolean> {
+    if (!this.botToken || !this.chatId) return false;
+
+    try {
+      const res = await fetch(`${TG_API}${this.botToken}/deleteMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: this.chatId,
+          message_id: messageId,
+        }),
+      });
+      const data = (await res.json()) as { ok: boolean; description?: string };
+      if (!data.ok) {
+        console.warn('[TelegramCodeBridge] deleteMessage failed:', data.description);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.warn('[TelegramCodeBridge] deleteMessage error:', err);
+      return false;
     }
   }
 
@@ -309,9 +433,97 @@ export class TelegramCodeBridge {
   }
 }
 
+// ── Utilities ───────────────────────────────────────────────────
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+/**
+ * Split a long (already HTML-escaped) body into chunks that fit Telegram's
+ * 4096-character limit.
+ *
+ * The first chunk includes the header prefix. Subsequent chunks include a
+ * "… (N/M)" continuation label. If `wrapOpen`/`wrapClose` are given (e.g.
+ * `<pre>` / `</pre>`), each chunk is wrapped so HTML stays valid.
+ *
+ * Splitting happens on newline boundaries when possible; otherwise mid-line.
+ */
+function splitForTelegram(
+  escapedBody: string,
+  headerPrefix: string,
+  wrapOpen: string,
+  wrapClose: string,
+): string[] {
+  // Fast path: if everything fits in one message, return immediately.
+  const singleMsg = `${headerPrefix}${wrapOpen}${escapedBody}${wrapClose}`;
+  if (singleMsg.length <= TG_MAX_LENGTH) {
+    return [singleMsg];
+  }
+
+  // Reserve space for the continuation label, e.g. "\n… (2/5)"
+  const CONT_RESERVE = 14;
+
+  // Split body into lines, then greedily pack lines into chunks
+  const lines = escapedBody.split('\n');
+  const chunks: string[] = [];
+  let currentLines: string[] = [];
+  let currentLen = 0;
+
+  const flushChunk = () => {
+    if (currentLines.length === 0) return;
+    chunks.push(currentLines.join('\n'));
+    currentLines = [];
+    currentLen = 0;
+  };
+
+  // Compute available body space per chunk (varies for first vs continuation)
+  const firstOverhead = headerPrefix.length + wrapOpen.length + wrapClose.length + CONT_RESERVE;
+  const contLabelLen = 16; // "… (NN/MM)\n" + wrapOpen + wrapClose
+  const contOverhead = contLabelLen + wrapOpen.length + wrapClose.length + CONT_RESERVE;
+  // Use the smaller budget to be safe
+  const maxBodyPerChunk = TG_MAX_LENGTH - Math.max(firstOverhead, contOverhead);
+
+  for (const line of lines) {
+    const lineLen = line.length + (currentLines.length > 0 ? 1 : 0); // +1 for \n separator
+
+    if (currentLen + lineLen > maxBodyPerChunk && currentLines.length > 0) {
+      flushChunk();
+    }
+
+    // Handle a single line that itself exceeds the budget: force-split it
+    if (line.length > maxBodyPerChunk) {
+      flushChunk();
+      let pos = 0;
+      while (pos < line.length) {
+        const slice = line.slice(pos, pos + maxBodyPerChunk);
+        chunks.push(slice);
+        pos += maxBodyPerChunk;
+      }
+      continue;
+    }
+
+    currentLines.push(line);
+    currentLen += lineLen;
+  }
+  flushChunk();
+
+  if (chunks.length === 0) return [singleMsg]; // shouldn't happen
+
+  // If only one chunk after splitting, return it directly
+  if (chunks.length === 1) {
+    return [`${headerPrefix}${wrapOpen}${chunks[0]}${wrapClose}`];
+  }
+
+  // Assemble final messages with headers and continuation labels
+  const total = chunks.length;
+  return chunks.map((body, i) => {
+    if (i === 0) {
+      return `${headerPrefix}${wrapOpen}${body}${wrapClose}\n… (1/${total})`;
+    }
+    return `${wrapOpen}${body}${wrapClose}\n… (${i + 1}/${total})`;
+  });
 }

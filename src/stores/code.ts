@@ -22,6 +22,19 @@ export interface CodeOutputChunk {
   pid?: number;
 }
 
+/**
+ * A parsed terminal event from Claude Code's stream-json output.
+ * Used to render a beautiful, structured activity log in the UI.
+ */
+export type TerminalEvent =
+  | { kind: 'system'; sessionId?: string; cwd?: string; tools?: string[]; model?: string; timestamp: number }
+  | { kind: 'thinking'; text: string; timestamp: number }
+  | { kind: 'text'; text: string; timestamp: number }
+  | { kind: 'tool_use'; id: string; tool: string; input: Record<string, unknown>; timestamp: number }
+  | { kind: 'tool_result'; id: string; output: string; isError?: boolean; timestamp: number }
+  | { kind: 'result'; text: string; timestamp: number }
+  | { kind: 'stderr'; text: string; timestamp: number };
+
 interface CodeState {
   // Working directory
   workingDirectory: string;
@@ -31,6 +44,9 @@ interface CodeState {
 
   // Terminal output (raw CLI output)
   terminalOutput: string;
+
+  // Parsed terminal events (structured activity log)
+  terminalEvents: TerminalEvent[];
 
   // Execution state
   isRunning: boolean;
@@ -71,6 +87,7 @@ export const useCodeStore = create<CodeState>((set, get) => ({
   workingDirectory: '',
   messages: [],
   terminalOutput: '',
+  terminalEvents: [],
   isRunning: false,
   activePid: null,
   error: null,
@@ -121,6 +138,7 @@ export const useCodeStore = create<CodeState>((set, get) => ({
       isRunning: true,
       error: null,
       terminalOutput: '',
+      terminalEvents: [],
     }));
 
     try {
@@ -149,46 +167,54 @@ export const useCodeStore = create<CodeState>((set, get) => ({
 
   handleOutput: (chunk: CodeOutputChunk) => {
     switch (chunk.type) {
-      case 'stdout':
+      case 'stdout': {
+        const rawData = chunk.data || '';
+        set((s) => ({
+          terminalOutput: s.terminalOutput + rawData,
+        }));
+
+        // Parse stream-json lines into structured events
+        const newEvents: TerminalEvent[] = [];
+        for (const line of rawData.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const parsed = JSON.parse(trimmed);
+            const evt = parseStreamJsonEvent(parsed);
+            if (evt) newEvents.push(evt);
+          } catch {
+            // Not JSON — skip
+          }
+        }
+        if (newEvents.length > 0) {
+          set((s) => ({
+            terminalEvents: [...s.terminalEvents, ...newEvents],
+          }));
+        }
+        break;
+      }
+
       case 'stderr':
         set((s) => ({
           terminalOutput: s.terminalOutput + (chunk.data || ''),
+          terminalEvents: chunk.data?.trim()
+            ? [...s.terminalEvents, { kind: 'stderr' as const, text: chunk.data.trim(), timestamp: Date.now() }]
+            : s.terminalEvents,
         }));
         break;
 
       case 'exit': {
-        const { terminalOutput, messages } = get();
-        // Try to extract a summary from the output for the chat message
-        let summary = '';
-        // Try parsing stream-json output for result text
-        const lines = terminalOutput.split('\n');
-        const resultLines: string[] = [];
-        for (const line of lines) {
-          const trimmedLine = line.trim();
-          if (!trimmedLine) continue;
-          try {
-            const parsed = JSON.parse(trimmedLine);
-            if (parsed.type === 'result' && parsed.result) {
-              resultLines.push(parsed.result);
-            } else if (parsed.type === 'assistant' && parsed.message?.content) {
-              const content = parsed.message.content;
-              if (typeof content === 'string') {
-                resultLines.push(content);
-              } else if (Array.isArray(content)) {
-                for (const block of content) {
-                  if (block.type === 'text' && block.text) {
-                    resultLines.push(block.text);
-                  }
-                }
-              }
-            }
-          } catch {
-            // Not JSON, skip
-          }
+        const { terminalEvents, messages } = get();
+        // Build summary from parsed events (prefer result events, fall back to text)
+        const resultParts: string[] = [];
+        const textParts: string[] = [];
+        for (const ev of terminalEvents) {
+          if (ev.kind === 'result') resultParts.push(ev.text);
+          else if (ev.kind === 'text') textParts.push(ev.text);
         }
-        summary = resultLines.join('\n').trim();
+        let summary = (resultParts.length > 0 ? resultParts : textParts).join('\n').trim();
         if (!summary) {
-          // Fallback: use last 500 chars of terminal output
+          const { terminalOutput } = get();
           summary = terminalOutput.length > 500
             ? `...${terminalOutput.slice(-500)}`
             : terminalOutput;
@@ -220,9 +246,9 @@ export const useCodeStore = create<CodeState>((set, get) => ({
     }
   },
 
-  clearTerminal: () => set({ terminalOutput: '' }),
+  clearTerminal: () => set({ terminalOutput: '', terminalEvents: [] }),
 
-  clearMessages: () => set({ messages: [], terminalOutput: '' }),
+  clearMessages: () => set({ messages: [], terminalOutput: '', terminalEvents: [] }),
 
   clearError: () => set({ error: null }),
 
@@ -313,3 +339,92 @@ export const useCodeStore = create<CodeState>((set, get) => ({
     }
   },
 }));
+
+// ── Stream-JSON Parser ──────────────────────────────────────────
+
+/**
+ * Parse a single stream-json object from Claude Code CLI into a TerminalEvent.
+ * Returns null for unrecognised or uninteresting events.
+ *
+ * Known event shapes:
+ *   { type: "system", session_id, cwd, tools, model, ... }
+ *   { type: "assistant", message: { content: string | ContentBlock[] } }
+ *   { type: "content_block_start", content_block: { type, ... } }
+ *   { type: "content_block_delta", delta: { type, text?, ... } }
+ *   { type: "tool_use",  tool: "...", input: {...}, id: "..." }   (aggregated by Claude CLI)
+ *   { type: "tool_result", tool_use_id: "...", content: "...", is_error?: boolean }
+ *   { type: "result", result: "...", ... }
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function parseStreamJsonEvent(raw: any): TerminalEvent | null {
+  const now = Date.now();
+  const type = raw?.type;
+
+  switch (type) {
+    case 'system':
+      return {
+        kind: 'system',
+        sessionId: raw.session_id,
+        cwd: raw.cwd,
+        tools: raw.tools,
+        model: raw.model,
+        timestamp: now,
+      };
+
+    case 'assistant': {
+      const content = raw.message?.content;
+      const events: TerminalEvent[] = [];
+      if (typeof content === 'string' && content.trim()) {
+        return { kind: 'text', text: content, timestamp: now };
+      }
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'text' && block.text?.trim()) {
+            events.push({ kind: 'text', text: block.text, timestamp: now });
+          } else if (block.type === 'tool_use') {
+            events.push({
+              kind: 'tool_use',
+              id: block.id || '',
+              tool: block.name || 'unknown',
+              input: block.input || {},
+              timestamp: now,
+            });
+          }
+        }
+        // Return only the first event; others will be emitted as separate assistant blocks.
+        // In practice, Claude CLI usually emits one content block per assistant message.
+        return events[0] || null;
+      }
+      return null;
+    }
+
+    case 'tool_use':
+      return {
+        kind: 'tool_use',
+        id: raw.id || raw.tool_use_id || '',
+        tool: raw.tool || raw.name || 'unknown',
+        input: raw.input || {},
+        timestamp: now,
+      };
+
+    case 'tool_result':
+      return {
+        kind: 'tool_result',
+        id: raw.tool_use_id || raw.id || '',
+        output: typeof raw.content === 'string'
+          ? raw.content
+          : JSON.stringify(raw.content || raw.output || ''),
+        isError: raw.is_error === true,
+        timestamp: now,
+      };
+
+    case 'result':
+      if (raw.result && typeof raw.result === 'string') {
+        return { kind: 'result', text: raw.result, timestamp: now };
+      }
+      return null;
+
+    default:
+      return null;
+  }
+}

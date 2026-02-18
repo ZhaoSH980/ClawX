@@ -17,6 +17,7 @@ import { useTranslation } from 'react-i18next';
 export function CodeMode() {
   const messages = useCodeStore((s) => s.messages);
   const terminalOutput = useCodeStore((s) => s.terminalOutput);
+  const terminalEvents = useCodeStore((s) => s.terminalEvents);
   const isRunning = useCodeStore((s) => s.isRunning);
   const error = useCodeStore((s) => s.error);
   const cliInstalled = useCodeStore((s) => s.cliInstalled);
@@ -182,6 +183,7 @@ export function CodeMode() {
           <div className="h-[40%] min-h-[150px] max-h-[50%]">
             <TerminalPanel
               output={terminalOutput}
+              events={terminalEvents}
               isRunning={isRunning}
               onClear={clearTerminal}
             />
