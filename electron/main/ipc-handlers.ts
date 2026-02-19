@@ -1457,21 +1457,31 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
    * extracted summary text after the process exits (used by the orchestrator loop).
    */
   async function executeCore(
-    prompt: string,
+    rawPrompt: string,
     options?: {
       cwd?: string;
       maxTurns?: number;
       fromTelegram?: boolean;
       /** If true, suppress automatic Telegram response and resolve with summary */
       collectOutput?: boolean;
+      /** Internal: skip --resume to avoid infinite retry loops */
+      _skipResume?: boolean;
     },
   ): Promise<{ success: boolean; pid?: number; error?: string; summary?: string }> {
     if (activeProcess) {
       return { success: false, error: 'A Claude Code process is already running' };
     }
 
+    // Strip leading slash commands that would confuse Claude Code CLI
+    // e.g. "/code 帮我重构…" → "帮我重构…"
+    let prompt = rawPrompt;
+    if (/^\/code[\s\n]/i.test(prompt)) {
+      prompt = prompt.slice(6).trim();
+    }
+
     const cwd = options?.cwd || process.cwd();
     const maxTurns = options?.maxTurns ?? 50;
+    const useResume = !options?._skipResume && !!claudeSessionId;
 
     if (!existsSync(cwd)) {
       return { success: false, error: `Working directory does not exist: ${cwd}` };
@@ -1488,15 +1498,15 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
       const args = [
         '-p', prompt,
         '--output-format', 'stream-json',
-        '--max-turns', String(maxTurns),
         '--verbose',
+        '--max-turns', String(maxTurns),
         // Non-interactive: skip "allow execution?" prompts so commands run without manual approval
         '--dangerously-skip-permissions',
       ];
 
-      // Use --continue to maintain conversation context across commands
-      if (claudeSessionId) {
-        args.push('--resume', claudeSessionId);
+      // Use --resume to maintain conversation context across commands
+      if (useResume) {
+        args.push('--resume', claudeSessionId!);
       }
 
       activeProcess = spawn(claude.cmd, args, {
@@ -1508,6 +1518,8 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
 
       const pid = activeProcess.pid;
       let fullOutput = '';
+      /** Flag: set if we detect "No conversation found" — triggers auto-retry */
+      let sessionExpired = false;
 
       // When collectOutput is true, we resolve a promise on process exit
       const collectOutput = options?.collectOutput ?? false;
@@ -1541,6 +1553,16 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
                 try { mainWindow.webContents.send('code:session-id', claudeSessionId); } catch { /* */ }
               }
 
+              // Detect expired/invalid session: Claude Code returns errors array
+              if (useResume && Array.isArray(parsed.errors)) {
+                const hasSessionError = parsed.errors.some(
+                  (e: unknown) => typeof e === 'string' && e.includes('No conversation found'),
+                );
+                if (hasSessionError) {
+                  sessionExpired = true;
+                }
+              }
+
               // Feed to progress tracker
               if (progressTracker) {
                 progressTracker.onStreamEvent(parsed);
@@ -1555,12 +1577,38 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
 
         activeProcess!.stderr?.on('data', (data: Buffer) => {
           const text = data.toString();
+          // Also check stderr for session errors
+          if (useResume && text.includes('No conversation found')) {
+            sessionExpired = true;
+          }
           try {
             mainWindow.webContents.send('code:output', { type: 'stderr', data: text, pid });
           } catch { /* window closed */ }
         });
 
         activeProcess!.on('close', async (code, signal) => {
+          activeProcess = null;
+
+          // Auto-retry: if session was expired, clear it and re-execute without --resume
+          if (sessionExpired && useResume) {
+            console.log('[CodeMode] Session expired, clearing and retrying without --resume');
+            claudeSessionId = null;
+            await setSetting('codeSessionId', '').catch(() => {});
+            try { mainWindow.webContents.send('code:session-id', null); } catch { /* */ }
+
+            // Clean up progress message
+            if (progressTracker) {
+              await progressTracker.finish();
+            }
+
+            // Retry without --resume
+            const retryResult = await executeCore(prompt, { ...options, _skipResume: true });
+            if (collectOutput) {
+              resolve(retryResult);
+            }
+            return;
+          }
+
           try {
             mainWindow.webContents.send('code:output', {
               type: 'exit',
@@ -1582,8 +1630,6 @@ function registerCodeModeHandlers(mainWindow: BrowserWindow, gatewayManager: Gat
             telegramBridge.sendAssistantResponse(summary, lastTgCommandMsgId).catch(() => {});
             lastTgCommandMsgId = null;
           }
-
-          activeProcess = null;
 
           if (collectOutput) {
             resolve({ success: true, pid, summary });
