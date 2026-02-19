@@ -20,6 +20,7 @@ app.disableHardwareAcceleration();
 
 // Global references
 let mainWindow: BrowserWindow | null = null;
+let isQuitting = false;
 const gatewayManager = new GatewayManager();
 const clawHubService = new ClawHubService();
 
@@ -120,6 +121,16 @@ async function initialize(): Promise<void> {
   // Create system tray
   createTray(mainWindow);
 
+  // Inject OpenRouter site headers (HTTP-Referer & X-Title) for rankings on openrouter.ai
+  session.defaultSession.webRequest.onBeforeSendHeaders(
+    { urls: ['https://openrouter.ai/*'] },
+    (details, callback) => {
+      details.requestHeaders['HTTP-Referer'] = 'https://claw-x.com';
+      details.requestHeaders['X-Title'] = 'ClawX';
+      callback({ requestHeaders: details.requestHeaders });
+    },
+  );
+
   // Override security headers ONLY for the OpenClaw Gateway Control UI
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     const isGatewayUrl = details.url.includes('127.0.0.1:18789') || details.url.includes('localhost:18789');
@@ -154,7 +165,14 @@ async function initialize(): Promise<void> {
   // Note: Auto-check for updates is driven by the renderer (update store init)
   // so it respects the user's "Auto-check for updates" setting.
 
-  // Handle window close
+  // Windows: minimize to tray on close instead of quitting
+  mainWindow.on('close', (event) => {
+    if (process.platform === 'win32' && !isQuitting) {
+      event.preventDefault();
+      mainWindow?.hide();
+    }
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
@@ -190,6 +208,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', async () => {
+  isQuitting = true;
   await gatewayManager.stop();
 });
 

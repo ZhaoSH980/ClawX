@@ -2,8 +2,11 @@
  * IPC Handlers
  * Registers all IPC handlers for main-renderer communication
  */
-import { ipcMain, BrowserWindow, shell, dialog, app } from 'electron';
-import { existsSync } from 'node:fs';
+import { ipcMain, BrowserWindow, shell, dialog, app, nativeImage } from 'electron';
+import { existsSync, copyFileSync, statSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, extname, basename } from 'node:path';
+import crypto from 'node:crypto';
 import { GatewayManager } from '../gateway/manager';
 import { ClawHubService, ClawHubSearchParams, ClawHubInstallParams, ClawHubUninstallParams } from '../gateway/clawhub';
 import {
@@ -90,6 +93,9 @@ export function registerIpcHandlers(
 
   // WhatsApp handlers
   registerWhatsAppHandlers(mainWindow);
+
+  // File staging handlers (upload/send separation)
+  registerFileHandlers();
 }
 
 /**
@@ -437,6 +443,89 @@ function registerGatewayHandlers(
       const result = await gatewayManager.rpc(method, params, timeoutMs);
       return { success: true, result };
     } catch (error) {
+      return { success: false, error: String(error) };
+    }
+  });
+
+  // Chat send with media — reads staged files from disk and builds attachments.
+  // Raster images (png/jpg/gif/webp) are inlined as base64 vision attachments.
+  // All other files are referenced by path in the message text so the model
+  // can access them via tools (the same format channels use).
+  const VISION_MIME_TYPES = new Set([
+    'image/png', 'image/jpeg', 'image/bmp', 'image/webp',
+  ]);
+
+  ipcMain.handle('chat:sendWithMedia', async (_, params: {
+    sessionKey: string;
+    message: string;
+    deliver?: boolean;
+    idempotencyKey: string;
+    media?: Array<{ filePath: string; mimeType: string; fileName: string }>;
+  }) => {
+    try {
+      let message = params.message;
+      // The Gateway processes image attachments through TWO parallel paths:
+      // Path A: `attachments` param → parsed via `parseMessageWithAttachments` →
+      //   injected as inline vision content when the model supports images.
+      //   Format: { content: base64, mimeType: string, fileName?: string }
+      // Path B: `[media attached: ...]` in message text → Gateway's native image
+      //   detection (`detectAndLoadPromptImages`) reads the file from disk and
+      //   injects it as inline vision content. Also works for history messages.
+      // We use BOTH paths for maximum reliability.
+      const imageAttachments: Array<Record<string, unknown>> = [];
+      const fileReferences: string[] = [];
+
+      if (params.media && params.media.length > 0) {
+        for (const m of params.media) {
+          logger.info(`[chat:sendWithMedia] Processing file: ${m.fileName} (${m.mimeType}), path: ${m.filePath}, exists: ${existsSync(m.filePath)}, isVision: ${VISION_MIME_TYPES.has(m.mimeType)}`);
+
+          // Always add file path reference so the model can access it via tools
+          fileReferences.push(
+            `[media attached: ${m.filePath} (${m.mimeType}) | ${m.filePath}]`,
+          );
+
+          if (VISION_MIME_TYPES.has(m.mimeType)) {
+            // Send as base64 attachment in the format the Gateway expects:
+            // { content: base64String, mimeType: string, fileName?: string }
+            // The Gateway normalizer looks for `a.content` (NOT `a.source.data`).
+            const fileBuffer = readFileSync(m.filePath);
+            const base64Data = fileBuffer.toString('base64');
+            logger.info(`[chat:sendWithMedia] Read ${fileBuffer.length} bytes, base64 length: ${base64Data.length}`);
+            imageAttachments.push({
+              content: base64Data,
+              mimeType: m.mimeType,
+              fileName: m.fileName,
+            });
+          }
+        }
+      }
+
+      // Append file references to message text so the model knows about them
+      if (fileReferences.length > 0) {
+        const refs = fileReferences.join('\n');
+        message = message ? `${message}\n\n${refs}` : refs;
+      }
+
+      const rpcParams: Record<string, unknown> = {
+        sessionKey: params.sessionKey,
+        message,
+        deliver: params.deliver ?? false,
+        idempotencyKey: params.idempotencyKey,
+      };
+
+      if (imageAttachments.length > 0) {
+        rpcParams.attachments = imageAttachments;
+      }
+
+      logger.info(`[chat:sendWithMedia] Sending: message="${message.substring(0, 100)}", attachments=${imageAttachments.length}, fileRefs=${fileReferences.length}`);
+
+      // Use a longer timeout when images are present (120s vs default 30s)
+      const timeoutMs = imageAttachments.length > 0 ? 120000 : 30000;
+      const result = await gatewayManager.rpc('chat.send', rpcParams, timeoutMs);
+      logger.info(`[chat:sendWithMedia] RPC result: ${JSON.stringify(result)}`);
+      return { success: true, result };
+    } catch (error) {
+      logger.error(`[chat:sendWithMedia] Error: ${String(error)}`);
       return { success: false, error: String(error) };
     }
   });
@@ -958,7 +1047,7 @@ function registerProviderHandlers(): void {
   );
 }
 
-type ValidationProfile = 'openai-compatible' | 'google-query-key' | 'anthropic-header' | 'none';
+type ValidationProfile = 'openai-compatible' | 'google-query-key' | 'anthropic-header' | 'openrouter' | 'none';
 
 /**
  * Validate API key using lightweight model-listing endpoints (zero token cost).
@@ -990,6 +1079,8 @@ async function validateApiKeyWithProvider(
         return await validateGoogleQueryKey(providerType, trimmedKey, options?.baseUrl);
       case 'anthropic-header':
         return await validateAnthropicHeaderKey(providerType, trimmedKey, options?.baseUrl);
+      case 'openrouter':
+        return await validateOpenRouterKey(providerType, trimmedKey);
       default:
         return { valid: false, error: `Unsupported validation profile for provider: ${providerType}` };
     }
@@ -1057,6 +1148,8 @@ function getValidationProfile(providerType: string): ValidationProfile {
       return 'anthropic-header';
     case 'google':
       return 'google-query-key';
+    case 'openrouter':
+      return 'openrouter';
     case 'ollama':
       return 'none';
     default:
@@ -1113,9 +1206,70 @@ async function validateOpenAiCompatibleKey(
     return { valid: false, error: `Base URL is required for provider "${providerType}" validation` };
   }
 
-  const url = buildOpenAiModelsUrl(trimmedBaseUrl);
   const headers = { Authorization: `Bearer ${apiKey}` };
-  return await performProviderValidationRequest(providerType, url, headers);
+
+  // Try /models first (standard OpenAI-compatible endpoint)
+  const modelsUrl = buildOpenAiModelsUrl(trimmedBaseUrl);
+  const modelsResult = await performProviderValidationRequest(providerType, modelsUrl, headers);
+
+  // If /models returned 404, the provider likely doesn't implement it (e.g. MiniMax).
+  // Fall back to a minimal /chat/completions POST which almost all providers support.
+  if (modelsResult.error?.includes('API error: 404')) {
+    console.log(
+      `[clawx-validate] ${providerType} /models returned 404, falling back to /chat/completions probe`
+    );
+    const base = normalizeBaseUrl(trimmedBaseUrl);
+    const chatUrl = `${base}/chat/completions`;
+    return await performChatCompletionsProbe(providerType, chatUrl, headers);
+  }
+
+  return modelsResult;
+}
+
+/**
+ * Fallback validation: send a minimal /chat/completions request.
+ * We intentionally use max_tokens=1 to minimise cost. The goal is only to
+ * distinguish auth errors (401/403) from a working key (200/400/429).
+ * A 400 "invalid model" still proves the key itself is accepted.
+ */
+async function performChatCompletionsProbe(
+  providerLabel: string,
+  url: string,
+  headers: Record<string, string>
+): Promise<{ valid: boolean; error?: string }> {
+  try {
+    logValidationRequest(providerLabel, 'POST', url, headers);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'validation-probe',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 1,
+      }),
+    });
+    logValidationStatus(providerLabel, response.status);
+    const data = await response.json().catch(() => ({}));
+
+    // 401/403 → invalid key
+    if (response.status === 401 || response.status === 403) {
+      return { valid: false, error: 'Invalid API key' };
+    }
+    // 200, 400 (bad model but key accepted), 429 → key is valid
+    if (
+      (response.status >= 200 && response.status < 300) ||
+      response.status === 400 ||
+      response.status === 429
+    ) {
+      return { valid: true };
+    }
+    return classifyAuthResponse(response.status, data);
+  } catch (error) {
+    return {
+      valid: false,
+      error: `Connection error: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 async function validateGoogleQueryKey(
@@ -1144,6 +1298,16 @@ async function validateAnthropicHeaderKey(
     'x-api-key': apiKey,
     'anthropic-version': '2023-06-01',
   };
+  return await performProviderValidationRequest(providerType, url, headers);
+}
+
+async function validateOpenRouterKey(
+  providerType: string,
+  apiKey: string
+): Promise<{ valid: boolean; error?: string }> {
+  // Use OpenRouter's auth check endpoint instead of public /models
+  const url = 'https://openrouter.ai/api/v1/auth/key';
+  const headers = { Authorization: `Bearer ${apiKey}` };
   return await performProviderValidationRequest(providerType, url, headers);
 }
 
@@ -1303,5 +1467,203 @@ function registerWindowHandlers(mainWindow: BrowserWindow): void {
 
   ipcMain.handle('window:isMaximized', () => {
     return mainWindow.isMaximized();
+  });
+}
+
+// ── Mime type helpers ────────────────────────────────────────────
+
+const EXT_MIME_MAP: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.bmp': 'image/bmp',
+  '.ico': 'image/x-icon',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.avi': 'video/x-msvideo',
+  '.mkv': 'video/x-matroska',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.flac': 'audio/flac',
+  '.pdf': 'application/pdf',
+  '.zip': 'application/zip',
+  '.gz': 'application/gzip',
+  '.tar': 'application/x-tar',
+  '.7z': 'application/x-7z-compressed',
+  '.rar': 'application/vnd.rar',
+  '.json': 'application/json',
+  '.xml': 'application/xml',
+  '.csv': 'text/csv',
+  '.txt': 'text/plain',
+  '.md': 'text/markdown',
+  '.html': 'text/html',
+  '.css': 'text/css',
+  '.js': 'text/javascript',
+  '.ts': 'text/typescript',
+  '.py': 'text/x-python',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+};
+
+function getMimeType(ext: string): string {
+  return EXT_MIME_MAP[ext.toLowerCase()] || 'application/octet-stream';
+}
+
+function mimeToExt(mimeType: string): string {
+  for (const [ext, mime] of Object.entries(EXT_MIME_MAP)) {
+    if (mime === mimeType) return ext;
+  }
+  return '';
+}
+
+const OUTBOUND_DIR = join(homedir(), '.openclaw', 'media', 'outbound');
+
+/**
+ * Generate a preview data URL for image files.
+ * Resizes large images while preserving aspect ratio (only constrain the
+ * longer side so the image is never squished). The frontend handles
+ * square cropping via CSS object-fit: cover.
+ */
+function generateImagePreview(filePath: string, mimeType: string): string | null {
+  try {
+    const img = nativeImage.createFromPath(filePath);
+    if (img.isEmpty()) return null;
+    const size = img.getSize();
+    const maxDim = 512; // keep enough resolution for crisp display on Retina
+    // Only resize if larger than threshold — specify ONE dimension to keep ratio
+    if (size.width > maxDim || size.height > maxDim) {
+      const resized = size.width >= size.height
+        ? img.resize({ width: maxDim })   // landscape / square → constrain width
+        : img.resize({ height: maxDim }); // portrait → constrain height
+      return `data:image/png;base64,${resized.toPNG().toString('base64')}`;
+    }
+    // Small image — use original
+    const buf = readFileSync(filePath);
+    return `data:${mimeType};base64,${buf.toString('base64')}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * File staging IPC handlers
+ * Stage files to ~/.openclaw/media/outbound/ for gateway access
+ */
+function registerFileHandlers(): void {
+  // Stage files from real disk paths (used with dialog:open)
+  ipcMain.handle('file:stage', async (_, filePaths: string[]) => {
+    mkdirSync(OUTBOUND_DIR, { recursive: true });
+
+    const results = [];
+    for (const filePath of filePaths) {
+      const id = crypto.randomUUID();
+      const ext = extname(filePath);
+      const stagedPath = join(OUTBOUND_DIR, `${id}${ext}`);
+      copyFileSync(filePath, stagedPath);
+
+      const stat = statSync(stagedPath);
+      const mimeType = getMimeType(ext);
+      const fileName = basename(filePath);
+
+      // Generate preview for images
+      let preview: string | null = null;
+      if (mimeType.startsWith('image/')) {
+        preview = generateImagePreview(stagedPath, mimeType);
+      }
+
+      results.push({ id, fileName, mimeType, fileSize: stat.size, stagedPath, preview });
+    }
+    return results;
+  });
+
+  // Stage file from buffer (used for clipboard paste / drag-drop)
+  ipcMain.handle('file:stageBuffer', async (_, payload: {
+    base64: string;
+    fileName: string;
+    mimeType: string;
+  }) => {
+    mkdirSync(OUTBOUND_DIR, { recursive: true });
+
+    const id = crypto.randomUUID();
+    const ext = extname(payload.fileName) || mimeToExt(payload.mimeType);
+    const stagedPath = join(OUTBOUND_DIR, `${id}${ext}`);
+    const buffer = Buffer.from(payload.base64, 'base64');
+    writeFileSync(stagedPath, buffer);
+
+    const mimeType = payload.mimeType || getMimeType(ext);
+    const fileSize = buffer.length;
+
+    // Generate preview for images
+    let preview: string | null = null;
+    if (mimeType.startsWith('image/')) {
+      preview = generateImagePreview(stagedPath, mimeType);
+    }
+
+    return { id, fileName: payload.fileName, mimeType, fileSize, stagedPath, preview };
+  });
+
+  // Load thumbnails for file paths on disk (used to restore previews in history)
+  // Save an image to a user-chosen location (base64 data URI or existing file path)
+  ipcMain.handle('media:saveImage', async (_, params: {
+    base64?: string;
+    mimeType?: string;
+    filePath?: string;
+    defaultFileName: string;
+  }) => {
+    try {
+      const ext = params.defaultFileName.includes('.')
+        ? params.defaultFileName.split('.').pop()!
+        : (params.mimeType?.split('/')[1] || 'png');
+      const result = await dialog.showSaveDialog({
+        defaultPath: join(homedir(), 'Downloads', params.defaultFileName),
+        filters: [
+          { name: 'Images', extensions: [ext, 'png', 'jpg', 'jpeg', 'webp', 'gif'] },
+          { name: 'All Files', extensions: ['*'] },
+        ],
+      });
+      if (result.canceled || !result.filePath) return { success: false };
+
+      if (params.filePath && existsSync(params.filePath)) {
+        copyFileSync(params.filePath, result.filePath);
+      } else if (params.base64) {
+        const buffer = Buffer.from(params.base64, 'base64');
+        writeFileSync(result.filePath, buffer);
+      } else {
+        return { success: false, error: 'No image data provided' };
+      }
+      return { success: true, savedPath: result.filePath };
+    } catch (err) {
+      return { success: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle('media:getThumbnails', async (_, paths: Array<{ filePath: string; mimeType: string }>) => {
+    const results: Record<string, { preview: string | null; fileSize: number }> = {};
+    for (const { filePath, mimeType } of paths) {
+      try {
+        if (!existsSync(filePath)) {
+          results[filePath] = { preview: null, fileSize: 0 };
+          continue;
+        }
+        const stat = statSync(filePath);
+        let preview: string | null = null;
+        if (mimeType.startsWith('image/')) {
+          preview = generateImagePreview(filePath, mimeType);
+        }
+        results[filePath] = { preview, fileSize: stat.size };
+      } catch {
+        results[filePath] = { preview: null, fileSize: 0 };
+      }
+    }
+    return results;
   });
 }

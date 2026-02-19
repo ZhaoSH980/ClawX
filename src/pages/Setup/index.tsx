@@ -23,6 +23,7 @@ import {
 import { TitleBar } from '@/components/layout/TitleBar';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { Label } from '@/components/ui/label';
 import { cn } from '@/lib/utils';
 import { useGatewayStore } from '@/stores/gateway';
@@ -519,7 +520,7 @@ function RuntimeContent({ onStatusChange }: RuntimeContentProps) {
         }
         return prev;
       });
-    }, 120 * 1000); // 120 seconds — enough for gateway to fully initialize
+    }, 600 * 1000); // 600 seconds — enough for gateway to fully initialize
 
     return () => {
       if (gatewayTimeoutRef.current) {
@@ -559,27 +560,43 @@ function RuntimeContent({ onStatusChange }: RuntimeContentProps) {
     }
   };
 
+  const ERROR_TRUNCATE_LEN = 30;
+
   const renderStatus = (status: 'checking' | 'success' | 'error', message: string) => {
     if (status === 'checking') {
       return (
-        <span className="flex items-center gap-2 text-yellow-400">
-          <Loader2 className="h-4 w-4 animate-spin" />
+        <span className="flex items-center gap-2 text-yellow-400 whitespace-nowrap">
+          <Loader2 className="h-5 w-5 flex-shrink-0 animate-spin" />
           {message || 'Checking...'}
         </span>
       );
     }
     if (status === 'success') {
       return (
-        <span className="flex items-center gap-2 text-green-400">
-          <CheckCircle2 className="h-4 w-4" />
+        <span className="flex items-center gap-2 text-green-400 whitespace-nowrap">
+          <CheckCircle2 className="h-5 w-5 flex-shrink-0" />
           {message}
         </span>
       );
     }
+
+    const isLong = message.length > ERROR_TRUNCATE_LEN;
+    const displayMsg = isLong ? message.slice(0, ERROR_TRUNCATE_LEN) : message;
+
     return (
-      <span className="flex items-center gap-2 text-red-400">
-        <XCircle className="h-4 w-4" />
-        {message}
+      <span className="flex items-center gap-2 text-red-400 whitespace-nowrap">
+        <XCircle className="h-5 w-5 flex-shrink-0" />
+        <span>{displayMsg}</span>
+        {isLong && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="cursor-pointer text-red-300 hover:text-red-200 font-medium">...</span>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-sm whitespace-normal break-words text-xs">
+              {message}
+            </TooltipContent>
+          </Tooltip>
+        )}
       </span>
     );
   };
@@ -599,23 +616,27 @@ function RuntimeContent({ onStatusChange }: RuntimeContentProps) {
         </div>
       </div>
       <div className="space-y-3">
-        <div className="flex items-center justify-between p-3 rounded-lg bg-white/5">
-          <span>{t('runtime.nodejs')}</span>
-          {renderStatus(checks.nodejs.status, checks.nodejs.message)}
+        <div className="grid grid-cols-[1fr_auto] items-center gap-4 p-3 rounded-lg bg-muted/50">
+          <span className="text-left">{t('runtime.nodejs')}</span>
+          <div className="flex justify-end">
+            {renderStatus(checks.nodejs.status, checks.nodejs.message)}
+          </div>
         </div>
-        <div className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
-          <div>
+        <div className="grid grid-cols-[1fr_auto] items-center gap-4 p-3 rounded-lg bg-muted/50">
+          <div className="text-left min-w-0">
             <span>{t('runtime.openclaw')}</span>
             {openclawDir && (
-              <p className="text-xs text-muted-foreground mt-0.5 font-mono truncate max-w-[300px]">
+              <p className="text-xs text-muted-foreground mt-0.5 font-mono break-all">
                 {openclawDir}
               </p>
             )}
           </div>
-          {renderStatus(checks.openclaw.status, checks.openclaw.message)}
+          <div className="flex justify-end self-start mt-0.5">
+            {renderStatus(checks.openclaw.status, checks.openclaw.message)}
+          </div>
         </div>
-        <div className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
-          <div className="flex items-center gap-2">
+        <div className="grid grid-cols-[1fr_auto] items-center gap-4 p-3 rounded-lg bg-muted/50">
+          <div className="flex items-center gap-2 text-left">
             <span>Gateway Service</span>
             {checks.gateway.status === 'error' && (
               <Button variant="outline" size="sm" onClick={handleStartGateway}>
@@ -623,7 +644,9 @@ function RuntimeContent({ onStatusChange }: RuntimeContentProps) {
               </Button>
             )}
           </div>
-          {renderStatus(checks.gateway.status, checks.gateway.message)}
+          <div className="flex justify-end">
+            {renderStatus(checks.gateway.status, checks.gateway.message)}
+          </div>
         </div>
       </div>
 
@@ -682,7 +705,7 @@ function ProviderContent({
   onApiKeyChange,
   onConfiguredChange,
 }: ProviderContentProps) {
-  const { t } = useTranslation('setup');
+  const { t } = useTranslation(['setup', 'settings']);
   const [showKey, setShowKey] = useState(false);
   const [validating, setValidating] = useState(false);
   const [keyValid, setKeyValid] = useState<boolean | null>(null);
@@ -841,7 +864,7 @@ function ProviderContent({
         'provider:save',
         {
           id: providerIdForSave,
-          name: selectedProviderData?.name || selectedProvider,
+          name: selectedProvider === 'custom' ? t('settings:aiProviders.custom') : (selectedProviderData?.name || selectedProvider),
           type: selectedProvider,
           baseUrl: baseUrl.trim() || undefined,
           model: effectiveModelId,
@@ -925,7 +948,7 @@ function ProviderContent({
               )}
               <span className={cn('truncate text-left', !selectedProvider && 'text-muted-foreground')}>
                 {selectedProviderData
-                  ? `${selectedProviderData.name}${selectedProviderData.model ? ` — ${selectedProviderData.model}` : ''}`
+                  ? `${selectedProviderData.id === 'custom' ? t('settings:aiProviders.custom') : selectedProviderData.name}${selectedProviderData.model ? ` — ${selectedProviderData.model}` : ''}`
                   : t('provider.selectPlaceholder')}
               </span>
             </div>
@@ -964,7 +987,7 @@ function ProviderContent({
                       ) : (
                         <span className="text-sm leading-none shrink-0">{p.icon}</span>
                       )}
-                      <span className="truncate">{p.name}{p.model ? ` — ${p.model}` : ''}</span>
+                      <span className="truncate">{p.id === 'custom' ? t('settings:aiProviders.custom') : p.name}{p.model ? ` — ${p.model}` : ''}</span>
                     </div>
                     {isSelected && <Check className="h-4 w-4 text-primary shrink-0" />}
                   </button>
@@ -1527,7 +1550,7 @@ interface CompleteContentProps {
 }
 
 function CompleteContent({ selectedProvider, installedSkills }: CompleteContentProps) {
-  const { t } = useTranslation('setup');
+  const { t } = useTranslation(['setup', 'settings']);
   const gatewayStatus = useGatewayStore((state) => state.status);
 
   const providerData = providers.find((p) => p.id === selectedProvider);
@@ -1548,7 +1571,7 @@ function CompleteContent({ selectedProvider, installedSkills }: CompleteContentP
         <div className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
           <span>{t('complete.provider')}</span>
           <span className="text-green-400">
-            {providerData ? <span className="flex items-center gap-1.5">{getProviderIconUrl(providerData.id) ? <img src={getProviderIconUrl(providerData.id)} alt={providerData.name} className={`h-4 w-4 inline-block ${shouldInvertInDark(providerData.id) ? 'dark:invert' : ''}`} /> : providerData.icon} {providerData.name}</span> : '—'}
+            {providerData ? <span className="flex items-center gap-1.5">{getProviderIconUrl(providerData.id) ? <img src={getProviderIconUrl(providerData.id)} alt={providerData.name} className={`h-4 w-4 inline-block ${shouldInvertInDark(providerData.id) ? 'dark:invert' : ''}`} /> : providerData.icon} {providerData.id === 'custom' ? t('settings:aiProviders.custom') : providerData.name}</span> : '—'}
           </span>
         </div>
         <div className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
